@@ -13,9 +13,9 @@ project. Funily enough, I actually don't really _need_ static type checking if a
 I have reasonable assertions in the IR, and because it is the most difficult 
 feature I will consider it last.
 - [x] Functions
-- [/] Arithmetic
+- [ ] Arithmetic
     - [x] Bitwise 
-    - [/] Signed/Unsigned integer
+    - [ ] Signed/Unsigned integer
     - [ ] Vector
 - [ ] Pointers
 - [x] Control flow (if, while) 
