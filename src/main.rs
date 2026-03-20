@@ -1,107 +1,55 @@
-#![feature(bool_to_result)]
-#![feature(uint_bit_width)]
-
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-};
-
-mod asm;
-mod ir;
-mod parse;
-mod tokenize;
+use std::io::IsTerminal;
 
 fn main() {
-    fn arg_or_usage(bin: &str, args: &mut std::env::Args) -> String {
-        match args.next() {
-            Some(arg) => arg,
-            None => {
-                println!("USAGE: {bin} input");
-                println!("No inputs provided");
-                std::process::exit(1);
-            }
-        }
-    }
-
     let mut args = std::env::args();
     let bin = args.next().unwrap();
-    let path = arg_or_usage(&bin, &mut args);
-    let input = std::fs::read_to_string(&path).unwrap().leak();
-
-    let now = std::time::Instant::now();
-    let tokens = match tokenize::tokenize(input) {
-        Ok(tokens) => tokens,
-        Err(err) => {
-            tokenize::pretty_print(&path, input, err);
+    let path = match args.next() {
+        Some(arg) => arg,
+        None => {
+            println!("USAGE: {bin} input");
+            println!("No inputs provided");
             std::process::exit(1);
         }
     };
-    let tokenize_dur = now.elapsed();
-
-    let now = std::time::Instant::now();
-    let funcs = match parse::parse(&mut tokens.as_slice()) {
-        Ok(funcs) => funcs,
-        Err(err) => {
-            parse::pretty_print(&path, input, err);
-            std::process::exit(1);
+    let flags = args.collect::<Vec<_>>();
+    let run = flags.iter().any(|s| s == "-r");
+    let capture = flags.iter().any(|s| s == "-c");
+    let asm = flags.iter().any(|s| s == "-s");
+    if let Some(report) = slang::compile(&path) {
+        if asm {
+            println!("{}", report.asm);
         }
-    };
-    let parse_dur = now.elapsed();
 
-    let now = std::time::Instant::now();
-    let asm = asm::asm(&funcs);
-    let asm_dur = now.elapsed();
-    println!("{asm}");
+        if capture {
+            let path = format!("{}.txt", path.strip_suffix(".sl").unwrap());
+            let result = std::process::Command::new("/tmp/slexec").output().unwrap();
+            std::fs::write(&path, result.stdout).unwrap();
+            println!("Captured stdout to {}", path);
+        }
 
-    let now = std::time::Instant::now();
-    assembler(&asm);
-    linker();
-    let link_dur = now.elapsed();
+        if std::io::stdout().is_terminal() {
+            println!("\x1b[92m\x1b[1mCompiled\x1b[0m `{path}`");
+            println!("\x1b[38;5;246m... Parsing \t{:.4}\x1b[0m", report.parsing);
+            println!("\x1b[38;5;246m... Codegen \t{:.4}\x1b[0m", report.codegen);
+            println!("\x1b[38;5;246m... Linking \t{:.4}\x1b[0m", report.linking);
+            println!(
+                "\x1b[38;5;246m... Total   \t{:.4}\x1b[0m",
+                report.parsing + report.codegen + report.linking
+            );
+        } else {
+            println!("Compiled `{path}`");
+            println!("... Parsing \t{:.4}", report.parsing);
+            println!("... Codegen \t{:.4}", report.codegen);
+            println!("... Linking \t{:.4}", report.linking);
+            println!(
+                "... Total   \t{:.4}",
+                report.parsing + report.codegen + report.linking
+            );
+        }
 
-    println!("Tokenize\t{:.4}", tokenize_dur.as_secs_f32());
-    println!("Parsing \t{:.4}", parse_dur.as_secs_f32());
-    println!("Codegen \t{:.4}", asm_dur.as_secs_f32());
-    println!("Linking \t{:.4}", link_dur.as_secs_f32());
-    println!(
-        "Total   \t{:.4}",
-        tokenize_dur.as_secs_f32()
-            + parse_dur.as_secs_f32()
-            + asm_dur.as_secs_f32()
-            + link_dur.as_secs_f32()
-    );
-}
-
-fn assembler(asm: &str) {
-    let mut ass = Command::new("as")
-        .args(["-o", "/tmp/slbuild.o", "-"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    ass.stdin.take().unwrap().write_all(asm.as_bytes()).unwrap();
-    let output = ass.wait_with_output().unwrap();
-    if !output.status.success() {
-        std::process::exit(1);
-    }
-}
-
-fn linker() {
-    let output = std::process::Command::new("ld")
-        .args([
-            "-o",
-            "sl",
-            "-e",
-            "_start",
-            "-lSystem",
-            "-syslibroot",
-            "/Applications/Xcode.app/Contents/Developer/Platforms/\
-            MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk",
-            "/tmp/slbuild.o",
-        ])
-        .spawn()
-        .unwrap()
-        .wait()
-        .unwrap();
-    if !output.success() {
-        std::process::exit(1);
+        if run {
+            let result = std::process::Command::new("/tmp/slexec").status().unwrap();
+            std::process::exit(result.code().unwrap_or(0));
+        }
     }
 }

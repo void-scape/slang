@@ -1,8 +1,12 @@
 use crate::{
-    ir::{Arg, BinOp, Data, Func, Ir, UnaryOp},
+    arena::Arena,
+    ast::{
+        Ast, BinOp, BinOpKind, Block, Call, Declaration, Expr, Func, Ident, If, Literal,
+        LiteralKind, Return, Spanned, Type, TypeKind, UnaryOp, UnaryOpKind, While,
+    },
     tokenize::{Span, Token, TokenKind},
 };
-use std::{collections::HashMap, io::IsTerminal, panic::Location};
+use std::{io::IsTerminal, panic::Location};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -42,6 +46,7 @@ impl std::fmt::Display for Error {
             ErrorKind::UnmatchedDelimiter { delimiter } => {
                 f.write_str(&format!("Unmatched delimiter `{delimiter}`"))
             }
+            ErrorKind::Declaraction { kind } => f.write_str(&format!("Invalid {kind} declaration")),
             ErrorKind::Expression { got } => f.write_str(&format!("Invalid expression `{got}`")),
         }
     }
@@ -59,6 +64,9 @@ pub enum ErrorKind {
     },
     UnmatchedDelimiter {
         delimiter: TokenKind,
+    },
+    Declaraction {
+        kind: &'static str,
     },
     Expression {
         got: TokenKind,
@@ -82,37 +90,6 @@ pub fn pretty_print(path: &str, input: &str, err: Error) {
             break;
         }
         position += len;
-    }
-}
-
-// TODO: Memory opt: push and pop args off the stack as they come in and out of
-// scope such that the total stack length may be reduced.
-#[derive(Default)]
-struct Parser {
-    arg_map: HashMap<&'static str, Arg>,
-    arg: usize,
-    label: usize,
-}
-
-impl Parser {
-    fn var(&mut self, ident: &'static str) -> Arg {
-        *self.arg_map.entry(ident).or_insert_with(|| {
-            let arg = self.arg;
-            self.arg += 1;
-            Arg::Var(arg)
-        })
-    }
-
-    fn anonymous(&mut self) -> Arg {
-        let var = self.arg;
-        self.arg += 1;
-        Arg::Var(var)
-    }
-
-    fn label(&mut self) -> usize {
-        let label = self.label;
-        self.label += 1;
-        label
     }
 }
 
@@ -159,7 +136,7 @@ fn find_matching(tokens: &[Token], open: TokenKind, close: TokenKind) -> Result<
             }
             *o == 0
         })
-        .ok_or_else(|| Error {
+        .ok_or(Error {
             span: tokens[0].span,
             kind: ErrorKind::UnmatchedDelimiter {
                 delimiter: tokens[0].kind,
@@ -168,88 +145,131 @@ fn find_matching(tokens: &[Token], open: TokenKind, close: TokenKind) -> Result<
         })
 }
 
-fn args(parser: &mut Parser, ops: &mut Vec<Ir>, tokens: &[Token]) -> Result<Vec<Arg>> {
+fn args(arena: &mut Arena, tokens: &[Token]) -> Result<Vec<Expr>> {
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
     tokens
         .split(|t| t.kind == TokenKind::Comma)
-        .map(|mut arg_tokens| bin_op(parser, ops, &mut arg_tokens, 0))
+        .map(|mut arg_tokens| bin_op(arena, &mut arg_tokens, 0))
         .collect()
 }
 
-#[track_caller]
-fn term(parser: &mut Parser, ops: &mut Vec<Ir>, tokens: &mut &[Token]) -> Result<Arg> {
-    let arg = match tokens[0].kind {
-        TokenKind::Integer(imm) => Arg::Lit(imm),
-        TokenKind::Str(str) => Arg::Data(Data::Str(str)),
+fn expr(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Expr> {
+    let token = tokens[0];
+    match token.kind {
+        TokenKind::Let => {
+            *tokens = &tokens[1..];
+            let ident = Ident {
+                span: tokens[0].span,
+                value: tokens[0].ident()?,
+            };
+            tokens[1].is_kind(TokenKind::Equals)?;
+            *tokens = &tokens[2..];
+            let rhs = bin_op(arena, tokens, 0)?;
+            Ok(Expr::Declaration(Declaration {
+                span: token.span.collapse(rhs.span()),
+                ident,
+                ty: Some(Type::new(TypeKind::U64)),
+                rhs: Some(arena.allocate(rhs)),
+            }))
+        }
         TokenKind::Ident(ident) => {
+            *tokens = &tokens[1..];
             if tokens
-                .get(1)
+                .first()
                 .is_some_and(|t| t.kind == TokenKind::OpenParen)
             {
-                *tokens = &tokens[1..];
                 let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-                let args = args(parser, ops, &tokens[1..end_args])?;
+                let arguments = args(arena, &tokens[1..end_args])?;
+                let end_span = tokens[end_args].span;
                 *tokens = &tokens[end_args + 1..];
-                ops.push(Ir::Call {
-                    symbol: ident,
-                    args,
-                });
-                return Ok(Arg::CallReturn(ident));
+                Ok(Expr::Call(Call {
+                    span: token.span.collapse(end_span),
+                    ident: Ident {
+                        span: token.span,
+                        value: ident,
+                    },
+                    arguments: arena.allocate_slice(&arguments),
+                }))
             } else {
-                parser.var(ident)
+                Ok(Expr::Ident(Ident {
+                    span: token.span,
+                    value: ident,
+                }))
             }
+        }
+        TokenKind::Integer(integer) => {
+            *tokens = &tokens[1..];
+            Ok(Expr::Literal(Literal {
+                span: token.span,
+                kind: LiteralKind::Integer(integer),
+            }))
+        }
+        TokenKind::Str(str) => {
+            *tokens = &tokens[1..];
+            Ok(Expr::Literal(Literal {
+                span: token.span,
+                kind: LiteralKind::Str(str),
+            }))
         }
         TokenKind::Not => {
             *tokens = &tokens[1..];
-            let arg = term(parser, ops, tokens)?;
-            let dst = parser.anonymous();
-            ops.push(Ir::Unary {
-                dst,
-                src: arg,
-                una: UnaryOp::Not,
-            });
-            return Ok(dst);
+            let expr = expr(arena, tokens)?;
+            Ok(Expr::UnaryOp(UnaryOp {
+                span: token.span.collapse(expr.span()),
+                kind: UnaryOpKind::Not,
+                expr: arena.allocate(expr),
+            }))
         }
         TokenKind::OpenParen => {
             *tokens = &tokens[1..];
-            let arg = bin_op(parser, ops, tokens, 0)?;
+            let expr = bin_op(arena, tokens, 0)?;
             tokens[0].is_kind(TokenKind::CloseParen)?;
-            arg
+            *tokens = &tokens[1..];
+            Ok(expr)
         }
-        term => {
-            return Err(Error {
-                span: tokens[0].span,
-                kind: ErrorKind::Expression { got: term },
-                location: Location::caller(),
-            });
-        }
-    };
-    *tokens = &tokens[1..];
-    Ok(arg)
+        got => Err(Error {
+            span: tokens[0].span,
+            kind: ErrorKind::Expression { got },
+            location: Location::caller(),
+        }),
+    }
 }
 
-impl BinOp {
+impl BinOpKind {
     // Precedence according to the rust standard, of which I am familiar with:
     // https://doc.rust-lang.org/reference/expressions.html
-    const TABLE: &[&[BinOp]] = &[
-        &[BinOp::Or],
-        &[BinOp::And],
+    const TABLE: &[&[BinOpKind]] = &[
         &[
-            BinOp::Gt,
-            BinOp::Ge,
-            BinOp::Lt,
-            BinOp::Le,
-            BinOp::Eq,
-            BinOp::Ne,
+            BinOpKind::Assign,
+            BinOpKind::AddAssign,
+            BinOpKind::SubAssign,
+            BinOpKind::MulAssign,
+            BinOpKind::DivAssign,
+            BinOpKind::ModAssign,
+            BinOpKind::BitAndAssign,
+            BinOpKind::BitOrAssign,
+            BinOpKind::XorAssign,
+            BinOpKind::ShlAssign,
+            BinOpKind::ShrAssign,
         ],
-        &[BinOp::BitOr],
-        &[BinOp::Xor],
-        &[BinOp::BitAnd],
-        &[BinOp::Shr, BinOp::Shl],
-        &[BinOp::Add, BinOp::Sub],
-        &[BinOp::Mul, BinOp::Div, BinOp::Mod],
+        &[BinOpKind::Or],
+        &[BinOpKind::And],
+        &[
+            BinOpKind::Gt,
+            BinOpKind::Ge,
+            BinOpKind::Lt,
+            BinOpKind::Le,
+            BinOpKind::Eq,
+            BinOpKind::Ne,
+        ],
+        &[BinOpKind::BitOr],
+        &[BinOpKind::Xor],
+        &[BinOpKind::BitAnd],
+        &[BinOpKind::Shr, BinOpKind::Shl],
+        &[BinOpKind::Add, BinOpKind::Sub],
+        &[BinOpKind::Mul, BinOpKind::Div, BinOpKind::Mod],
     ];
     fn max_precedence() -> usize {
         Self::TABLE.len()
@@ -284,6 +304,18 @@ impl BinOp {
             TokenKind::Xor => Some(Self::Xor),
             TokenKind::Shr => Some(Self::Shr),
             TokenKind::Shl => Some(Self::Shl),
+            //
+            TokenKind::Equals => Some(Self::Assign),
+            TokenKind::AddAssign => Some(Self::AddAssign),
+            TokenKind::SubAssign => Some(Self::SubAssign),
+            TokenKind::MulAssign => Some(Self::MulAssign),
+            TokenKind::DivAssign => Some(Self::DivAssign),
+            TokenKind::ModAssign => Some(Self::ModAssign),
+            TokenKind::BitAndAssign => Some(Self::BitAndAssign),
+            TokenKind::BitOrAssign => Some(Self::BitOrAssign),
+            TokenKind::XorAssign => Some(Self::XorAssign),
+            TokenKind::ShlAssign => Some(Self::ShlAssign),
+            TokenKind::ShrAssign => Some(Self::ShrAssign),
             _ => None,
         }
     }
@@ -291,63 +323,30 @@ impl BinOp {
 
 // Stolen from tsoding's B compiler:
 // https://github.com/bext-lang/b/blob/main/src/b.rs#L515
-fn bin_op(
-    parser: &mut Parser,
-    ops: &mut Vec<Ir>,
-    tokens: &mut &[Token],
-    precedence: usize,
-) -> Result<Arg> {
-    if precedence > BinOp::max_precedence() {
-        return term(parser, ops, tokens);
+fn bin_op(arena: &mut Arena, tokens: &mut &[Token], precedence: usize) -> Result<Expr> {
+    if precedence > BinOpKind::max_precedence() {
+        return expr(arena, tokens);
     }
 
-    let mut lhs = bin_op(parser, ops, tokens, precedence + 1)?;
+    let mut lhs = bin_op(arena, tokens, precedence + 1)?;
     let mut saved = *tokens;
 
     if !tokens.is_empty()
-        && let Some(op) = BinOp::from_token(tokens[0].kind)
+        && let Some(op) = BinOpKind::from_token(tokens[0].kind)
         && op.precedence() == precedence
     {
         while !tokens.is_empty()
-            && let Some(op) = BinOp::from_token(tokens[0].kind)
+            && let Some(op) = BinOpKind::from_token(tokens[0].kind)
             && op.precedence() == precedence
         {
             *tokens = &tokens[1..];
-            let dst = parser.anonymous();
-            match op {
-                BinOp::And => {
-                    let skip = parser.label();
-                    ops.push(Ir::Store { dst, src: lhs });
-                    ops.push(Ir::JumpZero {
-                        label: skip,
-                        arg: lhs,
-                    });
-                    let rhs = bin_op(parser, ops, tokens, precedence + 1)?;
-                    ops.push(Ir::Store { dst, src: rhs });
-                    ops.push(Ir::Label { label: skip });
-                }
-                BinOp::Or => {
-                    let skip = parser.label();
-                    ops.push(Ir::Store { dst, src: lhs });
-                    ops.push(Ir::JumpNotZero {
-                        label: skip,
-                        arg: lhs,
-                    });
-                    let rhs = bin_op(parser, ops, tokens, precedence + 1)?;
-                    ops.push(Ir::Store { dst, src: rhs });
-                    ops.push(Ir::Label { label: skip });
-                }
-                _ => {
-                    let rhs = bin_op(parser, ops, tokens, precedence + 1)?;
-                    ops.push(Ir::Bin {
-                        dst,
-                        lhs,
-                        rhs,
-                        bin: op,
-                    });
-                }
-            }
-            lhs = dst;
+            let rhs = bin_op(arena, tokens, precedence + 1)?;
+            lhs = Expr::BinOp(BinOp {
+                span: lhs.span().collapse(rhs.span()),
+                kind: op,
+                lhs: arena.allocate(lhs),
+                rhs: arena.allocate(rhs),
+            });
             saved = *tokens;
         }
     }
@@ -356,193 +355,210 @@ fn bin_op(
     Ok(lhs)
 }
 
-#[track_caller]
-fn find_kind(tokens: &[Token], kind: TokenKind) -> Result<usize> {
-    tokens
-        .iter()
-        .position(|t| t.kind == kind)
-        .ok_or_else(|| Error {
-            span: tokens[tokens.len() - 1].span,
-            kind: ErrorKind::Expected {
-                expected: kind,
-                got: None,
-            },
-            location: Location::caller(),
-        })
-}
-
-// TODO: Memory opt: there should be a way to skip the intermediate stack
-// values by using registers directly, although this work will most likely
-// have to be done in the asm phase or a second opt pass.
-fn assign(parser: &mut Parser, ops: &mut Vec<Ir>, tokens: &mut &[Token]) -> Result<()> {
-    if tokens[0].is_kind_recoverable(TokenKind::Let).is_ok() {
-        let dst = parser.var(tokens[1].ident()?);
-        tokens[2].is_kind(TokenKind::Equals)?;
-        *tokens = &tokens[3..];
-        let src = bin_op(parser, ops, tokens, 0)?;
-        tokens[0].is_kind(TokenKind::Semi)?;
-        *tokens = &tokens[1..];
-        ops.push(Ir::Store { dst, src });
-        Ok(())
-    } else if tokens[1].is_kind_recoverable(TokenKind::Equals).is_ok() {
-        let dst = parser.var(tokens[0].ident()?);
-        tokens[1].is_kind(TokenKind::Equals)?;
-        *tokens = &tokens[2..];
-        let src = bin_op(parser, ops, tokens, 0)?;
-        tokens[0].is_kind(TokenKind::Semi)?;
-        *tokens = &tokens[1..];
-        ops.push(Ir::Store { dst, src });
-        Ok(())
-    } else {
-        Err(Error::recoverable())
-    }
-}
-
-fn ret(parser: &mut Parser, ops: &mut Vec<Ir>, tokens: &mut &[Token]) -> Result<()> {
-    tokens[0].is_kind_recoverable(TokenKind::Return)?;
-    let end = find_kind(tokens, TokenKind::Semi)?;
-    if end == 1 {
-        ops.push(Ir::Return { arg: None });
-        *tokens = &tokens[2..];
-    } else {
-        *tokens = &tokens[1..];
-        let arg = bin_op(parser, ops, tokens, 0)?;
-        ops.push(Ir::Return { arg: Some(arg) });
-        tokens[0].is_kind(TokenKind::Semi)?;
-        *tokens = &tokens[1..];
-    }
-    Ok(())
-}
-
-fn iff(parser: &mut Parser, ops: &mut Vec<Ir>, tokens: &mut &[Token]) -> Result<()> {
-    tokens[0].is_kind_recoverable(TokenKind::If)?;
-    let end_condition = find_kind(tokens, TokenKind::OpenCurly)?;
-    let condition = bin_op(parser, ops, &mut &tokens[1..end_condition], 0)?;
-    *tokens = &tokens[end_condition..];
-    let body = block(parser, tokens)?;
-    let zero_label = parser.label();
-    ops.push(Ir::JumpZero {
-        label: zero_label,
-        arg: condition,
-    });
-    ops.extend(body);
-    ops.push(Ir::Label { label: zero_label });
-    Ok(())
-}
-
-fn whil(parser: &mut Parser, ops: &mut Vec<Ir>, tokens: &mut &[Token]) -> Result<()> {
-    tokens[0].is_kind_recoverable(TokenKind::While)?;
-    let evaluate = parser.label();
-    ops.push(Ir::Label { label: evaluate });
+fn ret(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Ast> {
+    let token = tokens[0];
+    token.is_kind_recoverable(TokenKind::Return)?;
     *tokens = &tokens[1..];
-    let condition = bin_op(parser, ops, tokens, 0)?;
-    let body = block(parser, tokens)?;
-    let exit_label = parser.label();
-    ops.push(Ir::JumpZero {
-        label: exit_label,
-        arg: condition,
-    });
-    ops.extend(body);
-    ops.push(Ir::Jump { label: evaluate });
-    ops.push(Ir::Label { label: exit_label });
-    Ok(())
-}
-
-fn lvalue(parser: &mut Parser, ops: &mut Vec<Ir>, tokens: &mut &[Token]) -> Result<()> {
-    let _lvalue = bin_op(parser, ops, tokens, 0)?;
+    let ast = if tokens[0].kind == TokenKind::Semi {
+        Ast::Return(Return {
+            span: token.span,
+            expr: None,
+        })
+    } else {
+        let expr = bin_op(arena, tokens, 0)?;
+        Ast::Return(Return {
+            span: token.span.collapse(expr.span()),
+            expr: Some(expr),
+        })
+    };
     tokens[0].is_kind(TokenKind::Semi)?;
     *tokens = &tokens[1..];
-    Ok(())
+    Ok(ast)
 }
 
-fn block(parser: &mut Parser, tokens: &mut &[Token]) -> Result<Vec<Ir>> {
-    let mut ops = Vec::new();
+fn block(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Block> {
+    let mut statements = Vec::new();
+    let start = tokens[0];
     // TODO: This is always non recoverable?
-    tokens[0].is_kind(TokenKind::OpenCurly)?;
+    start.is_kind(TokenKind::OpenCurly)?;
     let end = find_matching(tokens, TokenKind::OpenCurly, TokenKind::CloseCurly)?;
     let block = &mut &tokens[1..end];
+    let end_span = tokens[end].span;
     *tokens = &tokens[end + 1..];
-    fn recoverable(result: Result<()>) -> Result<bool> {
+    while !block.is_empty() {
+        statements.push(ast(arena, block)?);
+    }
+    Ok(Block {
+        span: start.span.collapse(end_span),
+        statements: arena.allocate_slice(&statements),
+    })
+}
+
+fn block_ast(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Ast> {
+    let mut statements = Vec::new();
+    let start = tokens[0];
+    start.is_kind_recoverable(TokenKind::OpenCurly)?;
+    let end = find_matching(tokens, TokenKind::OpenCurly, TokenKind::CloseCurly)?;
+    let block = &mut &tokens[1..end];
+    let end_span = tokens[end].span;
+    *tokens = &tokens[end + 1..];
+    while !block.is_empty() {
+        statements.push(ast(arena, block)?);
+    }
+    Ok(Ast::Block(Block {
+        span: start.span.collapse(end_span),
+        statements: arena.allocate_slice(&statements),
+    }))
+}
+
+fn iff(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Ast> {
+    let token = tokens[0];
+    token.is_kind_recoverable(TokenKind::If)?;
+    *tokens = &tokens[1..];
+    let condition = bin_op(arena, tokens, 0)?;
+    let body = block(arena, tokens)?;
+    Ok(Ast::If(If {
+        span: token.span.collapse(body.span),
+        condition,
+        body,
+    }))
+}
+
+fn whilee(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Ast> {
+    let token = tokens[0];
+    token.is_kind_recoverable(TokenKind::While)?;
+    *tokens = &tokens[1..];
+    let condition = bin_op(arena, tokens, 0)?;
+    let body = block(arena, tokens)?;
+    Ok(Ast::While(While {
+        span: token.span.collapse(body.span),
+        condition,
+        body,
+    }))
+}
+
+fn lvalue(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Ast> {
+    let expr = bin_op(arena, tokens, 0)?;
+    tokens[0].is_kind(TokenKind::Semi)?;
+    *tokens = &tokens[1..];
+    Ok(Ast::Expr(expr))
+}
+
+#[track_caller]
+fn params(_arena: &mut Arena, tokens: &[Token]) -> Result<(bool, Vec<Declaration>)> {
+    if tokens.is_empty() {
+        return Ok((false, Vec::new()));
+    }
+    let start_span = tokens[0].span;
+    let mut variadic = false;
+    let args = tokens
+        .split(|t| t.kind == TokenKind::Comma)
+        .filter_map(|param| {
+            if param.len() == 1 && param[0].kind == TokenKind::Variadic {
+                variadic = true;
+                return None;
+            }
+            if param.len() != 3 {
+                return Some(Err(Error {
+                    span: start_span,
+                    kind: ErrorKind::Declaraction { kind: "parameter" },
+                    location: Location::caller(),
+                }));
+            }
+            let ident = match param[0].ident() {
+                Ok(ident) => ident,
+                Err(err) => return Some(Err(err)),
+            };
+            if let Err(err) = param[1].is_kind(TokenKind::Colon) {
+                return Some(Err(err));
+            }
+            let ty = match param[2].ident() {
+                Ok(ident) => ident,
+                Err(err) => return Some(Err(err)),
+            };
+            assert_eq!(ty, "u64");
+            Some(Ok(Declaration {
+                span: param[0].span.collapse(param[2].span),
+                ident: Ident {
+                    span: param[0].span,
+                    value: ident,
+                },
+                ty: Some(Type::new(TypeKind::U64)),
+                rhs: None,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((variadic, args))
+}
+
+fn func(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Ast> {
+    let token = tokens[0];
+    token.is_kind_recoverable(TokenKind::Fn)?;
+    let ident = tokens[1];
+    tokens[2].is_kind(TokenKind::OpenParen)?;
+    *tokens = &tokens[2..];
+    let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
+    let (variadic, arguments) = params(arena, &tokens[1..end_args])?;
+    *tokens = &tokens[end_args + 1..];
+    let mut returns = Vec::new();
+    if tokens[0].is_kind_recoverable(TokenKind::Arrow).is_ok() {
+        tokens[1].is_kind(TokenKind::Ident("u64"))?;
+        returns.push(Declaration {
+            span: tokens[1].span,
+            ident: Ident::default(),
+            ty: Some(Type::new(TypeKind::U64)),
+            rhs: None,
+        });
+        *tokens = &tokens[2..];
+    }
+    let body = block(arena, tokens)?;
+    Ok(Ast::Func(Func {
+        span: token.span.collapse(body.span),
+        ident: Ident {
+            span: ident.span,
+            value: ident.ident()?,
+        },
+        arguments: arena.allocate_slice(&arguments),
+        returns: arena.allocate_slice(&returns),
+        body,
+        variadic,
+    }))
+}
+
+#[track_caller]
+fn ast(arena: &mut Arena, tokens: &mut &[Token]) -> Result<Ast> {
+    fn recoverable<T>(result: Result<T>) -> Result<Option<T>> {
         match result {
-            Ok(_) => Ok(true),
+            Ok(val) => Ok(Some(val)),
             Err(err) => {
                 if err.kind == ErrorKind::Recoverable {
-                    Ok(false)
+                    Ok(None)
                 } else {
                     Err(err)
                 }
             }
         }
     }
-    'outer: while !block.is_empty() {
-        for f in [ret, assign, iff, whil, lvalue] {
-            if recoverable(f(parser, &mut ops, block))? {
-                continue 'outer;
-            }
+    for f in [func, ret, iff, whilee, lvalue, block_ast] {
+        if let Some(ast) = recoverable(f(arena, tokens))? {
+            return Ok(ast);
         }
     }
-    Ok(ops)
-}
-
-#[track_caller]
-fn params(parser: &mut Parser, tokens: &[Token]) -> Result<(bool, Vec<Arg>)> {
-    if tokens.is_empty() {
-        return Ok((false, Vec::new()));
-    }
-    let mut variadic = false;
-    let args = tokens
-        .split(|t| t.kind == TokenKind::Comma)
-        .filter_map(|param| {
-            assert_eq!(param.len(), 1);
-            match param[0].kind {
-                TokenKind::Variadic => {
-                    variadic = true;
-                    None
-                }
-                TokenKind::Ident(ident) => Some(Ok(parser.var(ident))),
-                got => Some(Err(Error {
-                    span: param[0].span,
-                    kind: ErrorKind::Expression { got },
-                    location: Location::caller(),
-                })),
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((variadic, args))
-}
-
-fn func(parser: &mut Parser, tokens: &mut &[Token]) -> Result<Func> {
-    // TODO: This is always non recoverable?
-    tokens[0].is_kind(TokenKind::Fn)?;
-    let ident = tokens[1].ident()?;
-    tokens[2].is_kind(TokenKind::OpenParen)?;
-    *tokens = &tokens[2..];
-    let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-    let (variadic, params) = params(parser, &tokens[1..end_args])?;
-    *tokens = &tokens[end_args + 1..];
-    let mut returns = Vec::new();
-    if tokens[0].is_kind_recoverable(TokenKind::Arrow).is_ok() {
-        tokens[1].is_kind(TokenKind::Ident("u64"))?;
-        returns.push(());
-        *tokens = &tokens[2..];
-    }
-    let body = block(parser, tokens)?;
-    Ok(Func {
-        ident,
-        params,
-        variadic,
-        returns,
-        body,
+    // TODO: Change this error... what do we expect here?
+    Err(Error {
+        kind: ErrorKind::Expression {
+            got: tokens[0].kind,
+        },
+        span: tokens[0].span,
+        location: Location::caller(),
     })
 }
 
-pub fn parse(tokens: &mut &[Token]) -> Result<Vec<Func>> {
-    let mut funcs = Vec::new();
-    let mut parser = Parser::default();
+pub fn parse(tokens: &mut &[Token]) -> Result<Vec<Ast>> {
+    let mut tree = Vec::new();
+    let mut arena = Arena::new(1024);
     while !tokens.is_empty() {
-        funcs.push(func(&mut parser, tokens)?);
-        parser.arg_map.clear();
-        parser.arg = 0;
+        tree.push(ast(&mut arena, tokens)?);
     }
-    Ok(funcs)
+    Ok(tree)
 }

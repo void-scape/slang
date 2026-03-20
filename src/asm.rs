@@ -1,282 +1,386 @@
-use crate::ir::{Arg, BinOp, Data, Func, Ir, UnaryOp};
+use crate::{
+    ast::UnaryOpKind,
+    ir::{Arg, Data, Ir, IrBinOpKind, StackSlot},
+};
 use std::collections::HashMap;
 
 #[derive(Default)]
-struct Mem {
-    frames: Vec<(HashMap<usize, usize>, usize)>,
-    data_map: HashMap<Data, &'static str>,
-    data: u64,
+struct DataSection {
+    map: HashMap<Data, &'static str>,
+    unique: usize,
 }
 
-impl Mem {
-    fn push_frame(&mut self) {
-        self.frames.push((HashMap::default(), 8));
-    }
-
-    fn offset(&mut self, var: usize) -> usize {
-        let last = self.frames.len() - 1;
-        let (map, offset) = &mut self.frames[last];
-        *map.entry(var).or_insert_with(|| {
-            let of = *offset;
-            *offset += 8;
-            of
-        })
-    }
-
+impl DataSection {
     fn data(&mut self, data: Data) -> &'static str {
-        self.data_map.entry(data).or_insert_with(|| {
-            let label = format!("d{}", self.data).leak();
-            self.data += 1;
-            label
+        self.map.entry(data).or_insert_with(|| {
+            let label = format!("d{}", self.unique);
+            self.unique += 1;
+            label.leak()
         })
-    }
-
-    fn pop_frame(&mut self) -> usize {
-        let (_, bytes) = self.frames.pop().unwrap();
-        bytes
     }
 }
 
-fn load(asm: &mut String, mem: &mut Mem, funcs: &[Func], arg: Arg, reg: u8) {
-    match arg {
-        Arg::Invalid => {
-            panic!("expected valid argument");
-        }
-        Arg::Var(v) => {
-            let src = mem.offset(v);
-            asm.push_str(&format!("\tldr x{reg}, [x29, -{src}]\n"));
+fn load(asm: &mut String, data: &mut DataSection, stack: &[StackSlot], dst: u8, src: Arg) {
+    match src {
+        Arg::Var(src) => {
+            let src_offset = stack[src].aligned_offset + 8;
+            asm.push_str(&format!("\tldr x{dst}, [x29, -{src_offset}]\n"));
         }
         Arg::Lit(lit) => {
             if lit.bit_width() <= 12 {
-                asm.push_str(&format!("\tmov x{reg}, {lit}\n"));
+                asm.push_str(&format!("\tmov x{dst}, {lit}\n"));
             } else {
-                asm.push_str(&format!("\tldr x{reg}, ={lit}\n"));
+                asm.push_str(&format!("\tldr x{dst}, ={lit}\n"));
             }
         }
-        Arg::Data(data) => {
-            let label = mem.data(data);
-            asm.push_str(&format!("\tadrp x{reg}, {label}@PAGE\n"));
-            asm.push_str(&format!("\tadd x{reg}, x{reg}, {label}@PAGEOFF\n"));
-        }
-        Arg::CallReturn(ident) => {
-            let func = funcs
-                .iter()
-                .find(|f| f.ident == ident)
-                .expect("valid function");
-            assert_eq!(func.returns.len(), 1);
-            asm.push_str(&format!("\tmov x{reg}, x0\n"));
+        Arg::Data(d) => {
+            let label = data.data(d);
+            asm.push_str(&format!("\tadrp x{dst}, {label}@PAGE\n"));
+            asm.push_str(&format!("\tadd x{dst}, x{dst}, {label}@PAGEOFF\n"));
         }
     }
 }
 
-fn store(asm: &mut String, mem: &mut Mem, dst: Arg, reg: u8) {
-    let dst = match dst {
-        Arg::Var(var) => mem.offset(var),
-        a => panic!("cannot write to {a:?}"),
-    };
-    asm.push_str(&format!("\tstr x{reg}, [x29, -{dst}]\n"));
+fn store_reg(asm: &mut String, stack: &[StackSlot], dst: Arg, src: u8) {
+    match dst {
+        Arg::Var(dst) => {
+            let dst_offset = stack[dst].aligned_offset + 8;
+            asm.push_str(&format!("\tstr x{src}, [x29, -{dst_offset}]\n"));
+        }
+        dst => panic!("cannot store into {dst:?}"),
+    }
 }
 
-fn asm_func(asm: &mut String, mem: &mut Mem, funcs: &[Func], func: &Func) {
-    mem.push_frame();
-    let mut cleanup_points = Vec::new();
-    asm.push_str(&format!("_{}:\n", func.ident));
-    let allocate_stack = asm.len();
-    // store all of the register arguments onto the stack
-    for (i, arg) in func.params.iter().enumerate() {
-        if i < 8 {
-            store(asm, mem, *arg, i as u8);
-        } else {
-            asm.push_str(&format!("\tldr x0, [x29, {}]\n", 8 + (i - 7) * 8));
-            store(asm, mem, *arg, 0);
+fn store(asm: &mut String, data: &mut DataSection, stack: &[StackSlot], dst: Arg, src: Arg) {
+    match dst {
+        Arg::Var(dst) => {
+            let scratch = 9;
+            load(asm, data, stack, scratch, src);
+            let dst_offset = stack[dst].aligned_offset + 8;
+            asm.push_str(&format!("\tstr x{scratch}, [x29, -{dst_offset}]\n"));
         }
+        dst => panic!("cannot store into {dst:?}"),
     }
-    if func.variadic {
-        panic!("variadics are fake lol");
-    }
-    for op in func.body.iter() {
+}
+
+pub fn asm(ir: &[Ir]) -> String {
+    let mut asm = String::new();
+    asm.push_str(".global _start\n");
+    asm.push_str("_start:\n");
+    asm.push_str("\tbl main\n");
+    asm.push_str("\tb _exit\n");
+    let mut data = DataSection::default();
+    let mut stack = None;
+    let mut callee_stack_offset = 0;
+    // temp r9..r15
+    let sa = 9;
+    let sb = 10;
+    let sc = 11;
+    for op in ir.iter() {
         match op {
             Ir::Store { dst, src } => {
-                let reg = 8;
-                load(asm, mem, funcs, *src, reg);
-                store(asm, mem, *dst, reg);
+                store(&mut asm, &mut data, stack.unwrap(), *dst, *src);
             }
             Ir::Unary { dst, src, una } => match una {
-                UnaryOp::Not => {
-                    let scratch = 8;
-                    load(asm, mem, funcs, *src, scratch);
-                    asm.push_str(&format!("\tmvn x{scratch}, x{scratch}\n"));
-                    store(asm, mem, *dst, scratch);
+                UnaryOpKind::Not => {
+                    load(&mut asm, &mut data, stack.unwrap(), sa, *src);
+                    asm.push_str(&format!("\tmvn x{sa}, x{sa}\n"));
+                    store_reg(&mut asm, stack.unwrap(), *dst, sa);
                 }
             },
             Ir::Bin { dst, lhs, rhs, bin } => {
-                load(asm, mem, funcs, *lhs, 9);
-                load(asm, mem, funcs, *rhs, 10);
+                load(&mut asm, &mut data, stack.unwrap(), sb, *lhs);
+                load(&mut asm, &mut data, stack.unwrap(), sc, *rhs);
                 match bin {
-                    BinOp::Add
-                    | BinOp::Sub
-                    | BinOp::Mul
-                    | BinOp::Div
-                    | BinOp::BitAnd
-                    | BinOp::BitOr
-                    | BinOp::Shr
-                    | BinOp::Shl
-                    | BinOp::Xor => {
+                    IrBinOpKind::Add
+                    | IrBinOpKind::Sub
+                    | IrBinOpKind::Mul
+                    | IrBinOpKind::Div
+                    | IrBinOpKind::BitAnd
+                    | IrBinOpKind::BitOr
+                    | IrBinOpKind::Shr
+                    | IrBinOpKind::Shl
+                    | IrBinOpKind::Xor => {
                         let op = match bin {
-                            BinOp::Add => "add",
-                            BinOp::Sub => "sub",
-                            BinOp::Mul => "mul",
-                            BinOp::Div => "udiv",
-                            BinOp::BitAnd => "and",
-                            BinOp::BitOr => "orr",
-                            BinOp::Xor => "eor",
-                            BinOp::Shr => "lsr",
-                            BinOp::Shl => "lsl",
+                            IrBinOpKind::Add => "add",
+                            IrBinOpKind::Sub => "sub",
+                            IrBinOpKind::Mul => "mul",
+                            IrBinOpKind::Div => "udiv",
+                            IrBinOpKind::BitAnd => "and",
+                            IrBinOpKind::BitOr => "orr",
+                            IrBinOpKind::Xor => "eor",
+                            IrBinOpKind::Shr => "lsr",
+                            IrBinOpKind::Shl => "lsl",
                             _ => unreachable!(),
                         };
-                        let reg = 8;
-                        asm.push_str(&format!("\t{op} x{reg}, x9, x10\n"));
-                        store(asm, mem, *dst, reg);
+                        asm.push_str(&format!("\t{op} x{sa}, x{sb}, x{sc}\n"));
+                        store_reg(&mut asm, stack.unwrap(), *dst, sa);
                     }
-                    BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
+                    IrBinOpKind::Eq
+                    | IrBinOpKind::Ne
+                    | IrBinOpKind::Gt
+                    | IrBinOpKind::Lt
+                    | IrBinOpKind::Ge
+                    | IrBinOpKind::Le => {
                         let cond = match bin {
-                            BinOp::Eq => "eq",
-                            BinOp::Ne => "ne",
-                            BinOp::Gt => "gt",
-                            BinOp::Ge => "ge",
-                            BinOp::Lt => "lt",
-                            BinOp::Le => "le",
+                            IrBinOpKind::Eq => "eq",
+                            IrBinOpKind::Ne => "ne",
+                            IrBinOpKind::Gt => "gt",
+                            IrBinOpKind::Ge => "ge",
+                            IrBinOpKind::Lt => "lt",
+                            IrBinOpKind::Le => "le",
                             _ => unreachable!(),
                         };
-                        let reg = 8;
-                        asm.push_str("\tcmp x9, x10\n");
-                        asm.push_str(&format!("\tcset x{reg}, {cond}\n"));
-                        store(asm, mem, *dst, reg);
+                        asm.push_str(&format!("\tcmp x{sb}, x{sc}\n"));
+                        asm.push_str(&format!("\tcset x{sa}, {cond}\n"));
+                        store_reg(&mut asm, stack.unwrap(), *dst, sa);
                     }
-                    BinOp::Mod => {
-                        let reg = 8;
-                        asm.push_str(&format!("\tudiv x{reg}, x9, x10\n"));
-                        asm.push_str(&format!("\tmsub x{reg}, x{reg}, x10, x9\n"));
-                        store(asm, mem, *dst, reg);
+                    IrBinOpKind::Mod => {
+                        asm.push_str(&format!("\tudiv x{sa}, x{sb}, x{sc}\n"));
+                        asm.push_str(&format!("\tmsub x{sa}, x{sa}, x{sc}, x{sb}\n"));
+                        store_reg(&mut asm, stack.unwrap(), *dst, sa);
                     }
-                    BinOp::And | BinOp::Or => unreachable!(),
                 }
             }
             Ir::Label { label } => {
-                asm.push_str(&format!("l{label}:\n"));
+                asm.push_str(&format!("{label}:\n"));
             }
             Ir::Jump { label } => {
-                asm.push_str(&format!("\tb l{label}\n"));
+                asm.push_str(&format!("\tb {label}\n"));
             }
             Ir::JumpZero { label, arg } => {
-                load(asm, mem, funcs, *arg, 8);
-                asm.push_str(&format!("\tcbz x8, l{label}\n"));
+                load(&mut asm, &mut data, stack.unwrap(), sa, *arg);
+                asm.push_str(&format!("\tcbz x{sa}, {label}\n"));
             }
             Ir::JumpNotZero { label, arg } => {
-                load(asm, mem, funcs, *arg, 8);
-                asm.push_str(&format!("\tcbnz x8, l{label}\n"));
+                load(&mut asm, &mut data, stack.unwrap(), sa, *arg);
+                asm.push_str(&format!("\tcbnz x{sa}, {label}\n"));
             }
-            Ir::Call { symbol, args } => {
-                let func = funcs
-                    .iter()
-                    .find(|f| f.ident == *symbol)
-                    .expect("valid function");
-                if args.len() > func.params.len() {
-                    assert!(func.variadic);
-                } else {
-                    assert_eq!(args.len(), func.params.len());
-                }
-
+            Ir::Allocate { size, slots } => {
+                stack = Some(slots);
+                let stack_size = size.next_multiple_of(16);
+                callee_stack_offset = stack_size + 16;
+                asm.push_str(&format!("\tsub sp, sp, {}\n", callee_stack_offset));
+                asm.push_str(&format!("\tstp x29, x30, [sp, {stack_size}]\n"));
+                asm.push_str(&format!("\tadd x29, sp, {stack_size}\n"));
+            }
+            Ir::Call {
+                symbol,
+                named,
+                arguments,
+                results,
+            } => {
+                let stack = stack.unwrap();
                 let allocate_stack = asm.len();
-                let mut allocated: usize = 0;
-                for (i, arg) in args.iter().enumerate() {
-                    if i < func.params.len() && i < 8 {
-                        load(asm, mem, funcs, *arg, i as u8);
-                    } else {
-                        allocated += 1;
-                        load(asm, mem, funcs, *arg, 8);
-                        asm.push_str(&format!(
-                            "\tstr x8, [sp, {}]\n",
-                            (i - func.params.len().min(8)) * 8
-                        ));
+
+                // The AAPCS64 calling convection as defined here:
+                // https://student.cs.uwaterloo.ca/~cs452/docs/rpi4b/aapcs64.pdf
+
+                // Initialization
+                // A.1: The Next General-purpose Register Number (NGRN) is set
+                // to zero.
+                let mut ngrn: usize = 0;
+                // A.2: The Next SIMD and Floating-point Register Number (NSRN)
+                // is set to zero.
+                let _nsrn = 0;
+                // A.3: The Next Scalable Predicate Register Number (NPRN) is
+                // set to zero
+                let _nprn = 0;
+                // A.4: The next stacked argument address (NSAA) is set to the
+                // current stack-pointer value (SP).
+                let mut nsaa: usize = 0; // sp
+
+                // Pre-padding and extension of arguments
+                for _arg in arguments.iter() {
+                    // B.1: If the argument type is a Pure Scalable Type, no
+                    // change is made at this stage
+                    // NOTE: All of the types are U64, so nothing is done in
+                    // this stage
+
+                    // B.2: NA
+
+                    // B.3: If the argument type is an HFA or an HVA, then the
+                    // argument is used unmodified.
+
+                    // B.4: If the argument type is a Composite Type that is
+                    // larger than 16 bytes, then the argument is copied to memory
+                    // allocated by the caller and the argument is replaced by a
+                    // pointer to the copy.
+
+                    // B.5: If the argument type is a Composite Type then the
+                    // size of the argument is rounded up to the nearest multiple
+                    // of 8 bytes.
+
+                    // B.6: NA
+                }
+
+                // Assignment of arguments to registers and stack
+                for (i, (arg, layout)) in arguments.iter().enumerate() {
+                    // variadics spill onto the stack?
+                    if i >= *named {
+                        ngrn = 8;
                     }
+
+                    // C.1-C.8 deal with vectors
+
+                    // C.9: If the argument is an Integral or Pointer Type, the
+                    // size of the argument is less than or equal to 8 bytes and
+                    // the NGRN is less than 8, the argument is copied to the
+                    // least significant bits in x[NGRN]. The NGRN is incremented
+                    // by one. The argument has now been allocated.
+                    if !layout.composite && layout.size <= 8 && ngrn < 8 {
+                        load(&mut asm, &mut data, stack, ngrn as u8, *arg);
+                        ngrn += 1;
+                        continue;
+                    }
+
+                    // C.10: If the argument has an alignment of 16 then the
+                    // NGRN is rounded up to the next even number.
+                    if layout.align == 16 {
+                        ngrn = ngrn.next_multiple_of(2);
+                    }
+
+                    // C.11 describes large integral types
+
+                    // C.12: If the argument is a Composite Type and the size in
+                    // double-words of the argument is not more than 8 minus NGRN,
+                    // then the argument is copied into consecutive general-purpose
+                    // registers, starting at x[NGRN]. The argument is passed as
+                    // though it had been loaded into the registers from a double
+                    // -word-aligned address with an appropriate sequence of LDR
+                    // instructions loading consecutive registers from memory
+                    // (the contents of any unused parts of the registers are
+                    // unspecified by this standard). The NGRN is incremented by
+                    // the number of registers used. The argument has now been
+                    // allocated
+                    if layout.composite && layout.size.div_ceil(8) <= 8 - ngrn {
+                        assert!(!layout.composite, "composites not implemented");
+                        continue;
+                    }
+
+                    // C.13: The NGRN is set to 8.
+                    ngrn = 8;
+
+                    // C.14: The NSAA is rounded up to the larger of 8 or the
+                    // Natural Alignment of the argument’s type.
+                    nsaa = nsaa.next_multiple_of(8.max(layout.align));
+
+                    // C.15: If the argument is a composite type then the argument
+                    // is copied to memory at the adjusted NSAA. The NSAA is
+                    // incremented by the size of the argument. The argument has
+                    // now been allocated.
+                    if layout.composite {
+                        assert!(!layout.composite, "composites not implemented");
+                        assert_eq!(layout.align, 8);
+                        assert_eq!(layout.size, 8);
+                        load(&mut asm, &mut data, stack, sa, *arg);
+                        asm.push_str(&format!("\tstr x{sa}, [sp, {nsaa}]\n"));
+                        nsaa += layout.size;
+                        continue;
+                    }
+
+                    // C.16: If the size of the argument is less than 8 bytes then
+                    // the size of the argument is set to 8 bytes. The effect is
+                    // as if the argument was copied to the least significant bits
+                    // of a 64-bit register and the remaining bits filled with
+                    // unspecified values.
+                    let size = if layout.size < 8 { 8 } else { layout.size };
+
+                    // C.17: The argument is copied to memory at the adjusted NSAA.
+                    // The NSAA is incremented by the size of the argument. The
+                    // argument has now been allocated.
+                    assert_eq!(size, 8);
+                    load(&mut asm, &mut data, stack, sa, *arg);
+                    asm.push_str(&format!("\tstr x{sa}, [sp, {nsaa}]\n"));
+                    nsaa += size;
                 }
-                if allocated > 0 {
-                    let arg_stack = (allocated * 8).div_ceil(16) * 16;
-                    asm.insert_str(allocate_stack, &format!("\tsub sp, sp, {arg_stack}\n"));
-                    asm.push_str(&format!("\tbl _{symbol}\n"));
-                    asm.push_str(&format!("\tadd sp, sp, {arg_stack}\n"));
-                } else {
-                    asm.push_str(&format!("\tbl _{symbol}\n"));
+
+                let stack_size = nsaa.next_multiple_of(16);
+                if stack_size > 0 {
+                    asm.insert_str(allocate_stack, &format!("\tsub sp, sp, {stack_size}\n"));
+                }
+                asm.push_str(&format!("\tbl {symbol}\n"));
+                if stack_size > 0 {
+                    asm.push_str(&format!("\tadd sp, sp, {stack_size}\n"));
+                }
+
+                assert!(results.len() <= 1);
+                for (arg, layout) in results.iter() {
+                    // If the parameter passing algorithm above would have packed
+                    // the return value type into registers then it will use the
+                    // same algorithm. Otherwise, a pointer to the value is passed
+                    // in x8.
+                    //
+                    // Therefore, to be compliant with the spec, only the first
+                    // value will be packed, and the remaining values will be stored
+                    // in the address pointed to by x8.
+                    assert!(!layout.composite);
+                    assert_eq!(layout.size, 8);
+                    assert_eq!(layout.align, 8);
+                    store_reg(&mut asm, stack, *arg, 0);
                 }
             }
-            Ir::Return { arg } => match arg {
-                Some(arg) => {
-                    load(asm, mem, funcs, *arg, 0);
-                    cleanup_points.push(asm.len());
-                    asm.push_str("\tret\n");
+            Ir::LoadArguments { arguments } => {
+                let stack = stack.unwrap();
+                // Performs the reverse of the algorithm above.
+                let mut ngrn: usize = 0;
+                let mut nsaa: usize = 0;
+                let nsaa_offset = callee_stack_offset;
+                for (arg, layout) in arguments.iter() {
+                    // C.9
+                    if !layout.composite && layout.size <= 8 && ngrn < 8 {
+                        store_reg(&mut asm, stack, *arg, ngrn as u8);
+                        ngrn += 1;
+                        continue;
+                    }
+                    // // C.10
+                    // if layout.align == 16 {
+                    //     ngrn = ngrn.next_multiple_of(2);
+                    // }
+                    // C.13
+                    ngrn = 8;
+                    // C.14
+                    nsaa = nsaa.next_multiple_of(8.max(layout.align));
+                    // C.16
+                    let size = if layout.size < 8 { 8 } else { layout.size };
+                    // C.17
+                    assert_eq!(size, 8);
+                    asm.push_str(&format!("\tldr x{sa}, [sp, {}]\n", nsaa + nsaa_offset));
+                    store_reg(&mut asm, stack, *arg, sa);
+                    nsaa += size;
                 }
-                None => {
-                    cleanup_points.push(asm.len());
-                    asm.push_str("\tret\n");
+            }
+            Ir::Return {
+                results,
+                deallocate,
+            } => {
+                assert!(results.len() <= 1);
+                for (result, layout) in results.iter() {
+                    assert!(!layout.composite);
+                    assert_eq!(layout.size, 8);
+                    assert_eq!(layout.align, 8);
+                    load(&mut asm, &mut data, stack.unwrap(), 0, *result);
                 }
-            },
-        }
-    }
-    let bytes = mem.pop_frame();
-    let stack = bytes.div_ceil(16) * 16;
-    let cleanup_stack = format!(
-        "\tldp x29, x30, [sp, {stack}]\n\
-        \tadd sp, sp, {}\n",
-        stack + 16,
-    );
-    for index in cleanup_points.iter().rev() {
-        asm.insert_str(*index, &cleanup_stack);
-    }
-    if func
-        .body
-        .last()
-        .is_none_or(|t| !matches!(t, Ir::Return { .. }))
-    {
-        asm.push_str(&cleanup_stack);
-        asm.push_str("\tmov x0, 0\n");
-        asm.push_str("\tret\n");
-    }
-    asm.insert_str(
-        allocate_stack,
-        &format!(
-            "\tsub sp, sp, {}\n\
-            \tstp x29, x30, [sp, {stack}]\n\
-            \tadd x29, sp, {stack}\n",
-            stack + 16,
-        ),
-    );
-}
-
-pub fn asm(funcs: &[Func]) -> String {
-    let mut asm = String::from(".text\n");
-    asm.push_str(".global _start\n");
-    asm.push_str("_start:\n");
-    asm.push_str("\tbl _main\n");
-    asm.push_str("\tmov x16, 1\n");
-    asm.push_str("\tsvc 0x80\n");
-    let mut mem = Mem::default();
-    for func in funcs.iter() {
-        // TODO: attributes
-        if func.ident == "printf" || func.ident == "exit" {
-            continue;
-        }
-        asm_func(&mut asm, &mut mem, funcs, func);
-        mem.frames.clear();
-    }
-    asm.push_str(".data\n");
-    for (data, label) in mem.data_map.iter() {
-        match data {
-            Data::Str(str) => {
-                asm.push_str(&format!("\t{label}: .asciz \"{str}\"\n"));
+                // TODO: This makes the codegen work, but I don't like how implicit
+                // this structure is.
+                stack = None;
+                let stack_size = deallocate.next_multiple_of(16);
+                asm.push_str(&format!("\tldp x29, x30, [sp, {stack_size}]\n"));
+                asm.push_str(&format!("\tadd sp, sp, {}\n", stack_size + 16));
+                asm.push_str("\tret\n");
             }
         }
     }
-
+    if !data.map.is_empty() {
+        asm.push_str(".data\n");
+        for (data, label) in data.map.iter() {
+            asm.push_str(&format!(
+                "\t{label}: .asciz \"{}\"\n",
+                match data {
+                    Data::Str(str) => str,
+                }
+            ));
+        }
+    }
     asm
 }

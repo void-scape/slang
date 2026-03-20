@@ -54,6 +54,15 @@ pub struct Span {
     pub end: usize,
 }
 
+impl Span {
+    pub fn collapse(self, rhs: Self) -> Self {
+        Self {
+            start: self.start.min(rhs.start),
+            end: self.end.max(rhs.end),
+        }
+    }
+}
+
 macro_rules! token_kind {
     {
         keywords = [
@@ -109,13 +118,25 @@ token_kind! {
     ]
     delimiters = [
         Semi => ";",
+        Colon => ":",
         Comma => ",",
         OpenCurly => "{",
         CloseCurly => "}",
         OpenParen => "(",
         CloseParen => ")",
         Arrow => "->",
+        AddAssign => "+=",
+        SubAssign => "-=",
+        MulAssign => "*=",
+        DivAssign => "/=",
+        ModAssign => "%=",
+        BitAndAssign => "&=",
+        BitOrAssign => "|=",
+        XorAssign => "^=",
+        ShlAssign => "<<=",
+        ShrAssign => ">>=",
         Eq => "==",
+        Equals => "=",
         Ne => "!=",
         Shr => ">>",
         Ge => ">=",
@@ -130,7 +151,6 @@ token_kind! {
         Xor => "^",
         Not => "!",
         Mod => "%",
-        Equals => "=",
         Plus => "+",
         Minus => "-",
         Asterisk => "*",

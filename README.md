@@ -9,19 +9,17 @@ and implement the full compilation pipeline, from scratch, with no dependencies.
 
 ## Features
 Here is a list of the features I have identified as _necessary_ for completing my
-project. There are several, very important features in any self respecting lanugage
-that are _not_ considered in this list.
-- [ ] Static type checking 
-- [ ] Pointers
-- [ ] Casts
-- [ ] Functions
-- [ ] Global data
-- [ ] Arithmetic
-    - [ ] Signed/Unsigned integer
+project. Funily enough, I actually don't really _need_ static type checking if a 
+I have reasonable assertions in the IR, and because it is the most difficult 
+feature I will consider it last.
+- [x] Functions
+- [/] Arithmetic
+    - [x] Bitwise 
+    - [/] Signed/Unsigned integer
     - [ ] Vector
-- [ ] Bitwise operations 
-- [ ] Control flow (if, while, for) 
+- [ ] Pointers
+- [x] Control flow (if, while) 
+- [ ] Global data
 - [ ] Cortex-M33 codegen
-
-### TODO
-- Data returned from function calls needs to be stored on the stack, which means that the parser is going to need to do a prepass to collect all of the function signatures in advance.
+- [ ] Static type checking 
+    - [ ] Casts

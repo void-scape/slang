@@ -1,8 +1,8 @@
-fn printf(fmt, ...) {
+fn printf(fmt: u64, ...) {
 	// intrinsics //
 }
 
-fn exit(code) {
+fn exit(code: u64) {
 	// intrinsics //
 }
 
@@ -39,7 +39,11 @@ fn main() -> u64 {
 	return 0;
 }
 
-fn fib(n, a, b, n1, a1, b1, n2, a2, b2, n3, a3, b3) -> u64 {
+fn fib(
+	n: u64, a: u64, b: u64, n1: u64, a1: u64, b1: u64, 
+	n2: u64, a2: u64, b2: u64, n3: u64, a3: u64, b3: u64) 
+	-> u64 
+{
 	printf("I am in a function! %d %d %d %d %d %d %d %d %d %d %d %d\n", 
 		n, a, b, n1, a1, b1, n2, a2, b2, n3, a3, b3);
 	return 80082;
@@ -55,7 +59,7 @@ fn logical() {
 	if first() || second() || third() {
 		printf("Log3\n");
 	}
-	if first() && second() || third() {
+	if first() && (second() || third()) {
 		printf("Log3\n");
 	}
 	if 0 + 1 && 69 {
@@ -101,7 +105,7 @@ fn bits() {
 	printf("\n");
 }
 
-fn binary_op(a, b, c, fmt) {
+fn binary_op(a: u64, b: u64, c: u64, fmt: u64) {
 	printf_binary(4, a);
 	printf(" %s ", fmt);
 	printf_binary(4, b);
@@ -110,7 +114,7 @@ fn binary_op(a, b, c, fmt) {
 	printf("\n");
 }
 
-fn printf_binary(b, n) {
+fn printf_binary(b: u64, n: u64) {
     if b > 1 {
 		printf_binary(b - 1, n >> 1);
 	}
