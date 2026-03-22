@@ -1,33 +1,25 @@
-use crate::stage::Stage;
+use crate::{Flags, stage::Stage};
 use bevy_app::prelude::*;
-use bevy_ecs::message::MessageWriter;
+use bevy_ecs::prelude::*;
 use bevy_state::state::OnEnter;
 
-#[derive(Default)]
-pub struct PostJobPlugin {
-    pub run: bool,
-    pub capture: bool,
+pub fn plugin(app: &mut App) {
+    app.add_systems(OnEnter(Stage::Post), (post, super::next_stage));
 }
 
-impl Plugin for PostJobPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(Stage::Post), post(self.run, self.capture));
-    }
-}
-
-fn post(run: bool, capture: bool) -> impl FnMut(MessageWriter<AppExit>) {
-    move |mut writer| {
-        println!("Running /tmp/slexec");
-        if capture {
-            let result = std::process::Command::new("/tmp/slexec").output().unwrap();
-            let path = "capture.txt";
-            std::fs::write(path, result.stdout).unwrap();
-            println!("Captured stdout to {}", path);
-            println!("{}", result.status);
-        } else if run {
-            let result = std::process::Command::new("/tmp/slexec").status().unwrap();
-            println!("{}", result);
-        }
-        writer.write(AppExit::Success);
+fn post(flags: Single<&Flags>) {
+    let mut output = flags.output();
+    output.insert_str(0, "./");
+    if flags.capture {
+        println!("Capturing {output}...");
+        let result = std::process::Command::new(&output).output().unwrap();
+        let path = "capture.txt";
+        std::fs::write(path, result.stdout).unwrap();
+        println!("Captured stdout to {}", path);
+        println!("{}", result.status);
+    } else if flags.run {
+        println!("Running {output}...");
+        let result = std::process::Command::new(&output).status().unwrap();
+        println!("{}", result);
     }
 }

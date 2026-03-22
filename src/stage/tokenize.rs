@@ -1,3 +1,4 @@
+use crate::Flags;
 use crate::stage::Stage;
 use bevy_app::prelude::*;
 use bevy_ecs::error::Result;
@@ -5,32 +6,30 @@ use bevy_ecs::prelude::*;
 use bevy_log::info;
 use bevy_state::state::OnEnter;
 
-pub fn plugin(files: Vec<String>) -> impl Fn(&mut App) {
-    move |app| {
-        let files = files.clone();
-        let load_files = move |mut commands: Commands| -> Result {
-            for file in files.iter() {
-                let content = std::fs::read_to_string(file)?;
-                info!(
-                    "leaking source file {}b",
-                    std::mem::size_of_val(content.as_bytes())
-                );
-                commands.spawn(StaticSourceFile(Box::leak(Box::new(SourceFile {
-                    path: file.clone(),
-                    content: content.leak(),
-                }))));
-            }
-            Ok(())
-        };
-        app.add_systems(
-            OnEnter(Stage::Tokenize),
-            (load_files, tokenize_files, super::next_stage).chain(),
-        );
-    }
+pub fn plugin(app: &mut App) {
+    app.add_systems(
+        OnEnter(Stage::Tokenize),
+        (load_files, tokenize_files, super::next_stage).chain(),
+    );
 }
 
 #[derive(Component)]
 pub struct StaticSourceFile(&'static SourceFile);
+
+fn load_files(mut commands: Commands, flags: Single<&Flags>) -> Result {
+    for input in flags.input.iter() {
+        let content = std::fs::read_to_string(input)?;
+        info!(
+            "leaking source file {}b",
+            std::mem::size_of_val(content.as_bytes())
+        );
+        commands.spawn(StaticSourceFile(Box::leak(Box::new(SourceFile {
+            path: input.clone(),
+            content: content.leak(),
+        }))));
+    }
+    Ok(())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct SourceFile {

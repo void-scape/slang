@@ -1,5 +1,5 @@
 use crate::stage::{Stage, codegen::Prog, ir::*};
-use crate::tree::*;
+use crate::{Flags, tree::*};
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, system::SystemParam};
 use bevy_state::state::OnEnter;
@@ -12,6 +12,7 @@ pub fn plugin(app: &mut App) {
             super::collect_ir_into_prog,
             (data_section, resolve_labels),
             asm,
+            output,
             crate::stage::next_stage,
         )
             .chain(),
@@ -155,8 +156,12 @@ fn store(
     Ok(())
 }
 
+#[derive(Component)]
+struct Asm(String);
+
 fn asm(
-    prog: Single<(&Prog, &DataSection)>,
+    mut commands: Commands,
+    prog: Single<(Entity, &Prog, &DataSection)>,
     query: AsmQuery,
     layouts: Query<&Layout>,
     procs: Query<(&Children, Option<&Args>), With<Proc>>,
@@ -164,7 +169,7 @@ fn asm(
     labels: Query<&AsmLabel>,
     prologues: Query<&AsmLabel, With<Prologue>>,
 ) -> Result {
-    let (prog, data_section) = prog.into_inner();
+    let (entity, prog, data_section) = prog.into_inner();
     // println!("{:#?}", prog.0);
     let mut asm = String::new();
     asm.push_str(".global _start\n");
@@ -505,39 +510,49 @@ fn asm(
         }
     }
     asm.push_str(&data_section.0);
-    println!("{asm}");
-    assembler(&asm)?;
-    linker()?;
+    commands.entity(entity).insert(Asm(asm));
     Ok(())
 }
 
-fn assembler(asm: &str) -> Result {
+fn output(flags: Single<&Flags>, asm: Single<&Asm>) -> Result {
+    if flags.codegen {
+        println!("{}", asm.0);
+    }
+    assemble_and_link(&asm.0, &flags.output())?;
+    Ok(())
+}
+
+fn assemble_and_link(asm: &str, output: &str) -> Result {
+    let obj = format!("{}.o", output.replace('/', "_"));
     let mut ass = std::process::Command::new("as")
-        .args(["-o", "/tmp/slbuild.o", "-"])
+        .args(["-o", &obj, "-"])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    ass.stdin.take().unwrap().write_all(asm.as_bytes()).unwrap();
-    let output = ass.wait_with_output().unwrap();
-    output.status.success().ok_or("Assembler failed".into())
-}
 
-fn linker() -> Result {
-    let output = std::process::Command::new("ld")
+    ass.stdin.take().unwrap().write_all(asm.as_bytes()).unwrap();
+    let ass_out = ass.wait_with_output().unwrap();
+    if !ass_out.status.success() {
+        return Err("Assembler failed".into());
+    }
+
+    let ld_out = std::process::Command::new("ld")
         .args([
             "-o",
-            "/tmp/slexec",
+            output,
             "-e",
             "_start",
             "-lSystem",
             "-syslibroot",
             "/Applications/Xcode.app/Contents/Developer/Platforms/\
             MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk",
-            "/tmp/slbuild.o",
+            &obj,
         ])
         .spawn()
         .unwrap()
         .wait()
         .unwrap();
-    output.success().ok_or("Linker failed".into())
+
+    let _ = std::fs::remove_file(&obj);
+    ld_out.success().ok_or("Linker failed".into())
 }

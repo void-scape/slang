@@ -8,22 +8,21 @@ use bevy_ecs::{
     prelude::*,
 };
 use bevy_log::error;
-use bevy_state::state::{State, StateTransition};
+use bevy_state::state::State;
 use std::{
     io::IsTerminal,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 pub fn plugin(app: &mut App) {
-    app.add_systems(StateTransition, check_stage_error)
-        .set_error_handler(pretty_print);
+    app.set_error_handler(pretty_print);
 }
 
 static ERROR: AtomicUsize = AtomicUsize::new(0);
-pub fn check_stage_error(stage: Res<State<Stage>>) {
+pub fn check_stage_error(stage: Res<State<Stage>>, mut writer: MessageWriter<AppExit>) {
     if ERROR.load(Ordering::SeqCst) > 0 {
         error!("Error encountered in {:?}", *stage);
-        std::process::exit(1);
+        writer.write(AppExit::error());
     }
 }
 

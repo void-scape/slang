@@ -1,4 +1,3 @@
-use crate::{Config, stage::post::PostJobPlugin};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_state::{
@@ -39,7 +38,11 @@ pub enum Stage {
     Post,
 }
 
-pub fn next_stage(mut commands: Commands, stage: Res<State<Stage>>) {
+pub fn next_stage(
+    mut commands: Commands,
+    stage: Res<State<Stage>>,
+    mut writer: MessageWriter<AppExit>,
+) {
     let stages = [
         Stage::Tokenize,
         Stage::Parse,
@@ -51,27 +54,23 @@ pub fn next_stage(mut commands: Commands, stage: Res<State<Stage>>) {
     ];
     let value = *stage.get() as usize;
     if let Some(state) = stages.get(value + 1) {
-        println!("current {:?}", stage.get());
-        println!("set {state:?} {}", value + 1);
+        commands.run_system_cached(crate::error::check_stage_error);
         commands.set_state(*state);
+    } else {
+        writer.write(AppExit::Success);
     }
 }
 
-pub fn plugin(files: Vec<String>, config: Config) -> impl Fn(&mut App) {
-    move |app| {
-        app.add_plugins(StatesPlugin)
-            .add_plugins((
-                tokenize::plugin(files.clone()),
-                parse::plugin,
-                variable::plugin,
-                ty::plugin,
-                ir::plugin,
-                codegen::plugin,
-                PostJobPlugin {
-                    run: config.run,
-                    capture: config.capture,
-                },
-            ))
-            .init_state::<Stage>();
-    }
+pub fn plugin(app: &mut App) {
+    app.add_plugins(StatesPlugin)
+        .add_plugins((
+            tokenize::plugin,
+            parse::plugin,
+            variable::plugin,
+            ty::plugin,
+            ir::plugin,
+            codegen::plugin,
+            post::plugin,
+        ))
+        .init_state::<Stage>();
 }

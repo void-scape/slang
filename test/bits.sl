@@ -1,17 +1,48 @@
-// const PERIPH_BASE_NS: u64 = 0x40000000;
-
 extern fn printf(fmt: str, ...);
-// 
-// fn passthrough() -> u64 {
-// 	return 69;
-// }
-
+extern fn exit(code: u64);
+fn assert_eq(a: u64, b: u64) {
+	if a != b {
+		printf("FAILED\n");
+		exit(1);
+	}
+}
 fn main() -> u64 {
-	let a = 1;
-	let b = 2;
-	let c = 0;
-	c = a + b;
-	// let value = passthrough();
-	printf("%d\n", c);
+	printf("%d\n", 0xFE);
+	printf("%d\n", 0b11111110);
+	assert_eq(0xfe, 0b11111110);
+	assert_eq(0xFE, 0xFE);
+	assert_eq(0xfe, (0b1111 << 4) + 0xe);
+	assert_eq(0x99, (0x9 << 4) | 0x9);
+	assert_eq(0x94, (0x9 << 4) | ((0x4 << 4) >> 4));
+	printf("%d\n", 0x94);
+	printf("%d\n", (0x9 << 4) | ((0x4 << 4) >> 4));
+	assert_eq(0xa0, 0xf0 & 0xa0);
+	printf("%d\n", (0x9 << 4) | ((0x4 << 4) >> 4));
+	more_bits();
 	return 0;
+}
+fn more_bits() {
+	binary_op(9, 8, 9 & 8, "&");
+	binary_op(9, 8, 9 | 8, "|");
+	binary_op(9, 8, 9 ^ 8, "^");
+
+	printf("!");
+	printf_binary(4, 0);
+	printf(" = ");
+	printf_binary(4, !0);
+	printf("\n");
+}
+fn binary_op(a: u64, b: u64, c: u64, fmt: str) {
+	printf_binary(4, a);
+	printf(" %s ", fmt);
+	printf_binary(4, b);
+	printf(" = ");
+	printf_binary(4, c);
+	printf("\n");
+}
+fn printf_binary(b: u64, n: u64) {
+    if b > 1 {
+		printf_binary(b - 1, n >> 1);
+	}
+    printf("%d", n & 1);
 }
