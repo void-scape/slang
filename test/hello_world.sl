@@ -1,10 +1,7 @@
-fn printf(fmt: u64, ...) {
-	// intrinsics //
-}
 
-fn exit(code: u64) {
-	// intrinsics //
-}
+// libc
+extern fn printf(fmt: str, ...);
+extern fn exit(code: u64);
 
 fn main() -> u64 {
 	logical();
@@ -105,7 +102,7 @@ fn bits() {
 	printf("\n");
 }
 
-fn binary_op(a: u64, b: u64, c: u64, fmt: u64) {
+fn binary_op(a: u64, b: u64, c: u64, fmt: str) {
 	printf_binary(4, a);
 	printf(" %s ", fmt);
 	printf_binary(4, b);
