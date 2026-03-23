@@ -13,7 +13,14 @@ fn main() -> u64 {
 	assert_eq(0xFE, 0xFE);
 	assert_eq(0xfe, (0b1111 << 4) + 0xe);
 	assert_eq(0x99, (0x9 << 4) | 0x9);
-	assert_eq(0x94, (0x9 << 4) | ((0x4 << 4) >> 4));
+	// NOTE: All of these operations will be folded at compile time if they
+	// are entirely composed of literals...
+	let a: u64 = 0x4;
+	let b: u64 = (a << 4);
+	let c: u64 = (b >> 4);
+	let d: u64 = (0x9 << 4);
+	let e: u64 = d | c;
+	assert_eq(0x94, e);
 	printf("%d\n", 0x94);
 	printf("%d\n", (0x9 << 4) | ((0x4 << 4) >> 4));
 	assert_eq(0xa0, 0xf0 & 0xa0);

@@ -60,7 +60,7 @@ fn data_section(
 
 fn resolve_labels(
     mut commands: Commands,
-    labels: Query<(Entity, &Label, Has<Body>, Has<Epilogue>, Has<Unique>)>,
+    labels: Query<(Entity, &Label, Has<Narrative>, Has<Epilogue>, Has<Unique>)>,
 ) {
     for (entity, label, body, epilogue, unique) in labels.iter() {
         let mut postfix = String::with_capacity(32);
@@ -82,6 +82,7 @@ fn resolve_labels(
 #[derive(SystemParam)]
 pub struct AsmQuery<'w, 's> {
     args: Query<'w, 's, &'static Arg>,
+    types: Query<'w, 's, &'static Type>,
     literal_query: Query<'w, 's, &'static AsmLabel>,
     literals: Res<'w, Literals>,
 }
@@ -93,10 +94,24 @@ fn load(
     dst: u8,
     src: Entity,
 ) -> Result {
+    let (instr, reg) = match query.types.get(src)? {
+        Type::U8 => ("ldrb", "w"),
+        Type::U16 => ("ldrh", "w"),
+        Type::U32 => ("ldr", "w"),
+        Type::U64 => ("ldr", "x"),
+        //
+        Type::I8 => ("ldrsb", "w"),
+        Type::I16 => ("ldrsh", "w"),
+        Type::I32 => ("ldr", "w"),
+        Type::I64 => ("ldr", "x"),
+        //
+        Type::Str => ("ldr", "x"),
+        Type::Not => unreachable!(),
+    };
     match query.args.get(src).map_err(|_| "no load src arg")? {
         Arg::Var(id) => {
             let offset = stack.get(id).ok_or("var unallocated")?;
-            asm.push_str(&format!("\tldr x{dst}, [x29, -{offset}]\n"));
+            asm.push_str(&format!("\t{instr} {reg}{dst}, [x29, -{offset}]\n"));
         }
         Arg::Lit(id) => match query.literals.storage[*id] {
             Literal::Str(_) => {
@@ -109,15 +124,15 @@ fn load(
             }
             Literal::Integer(integer) => {
                 if integer.bit_width() <= 12 {
-                    asm.push_str(&format!("\tmov x{dst}, {integer}\n"));
+                    asm.push_str(&format!("\tmov {reg}{dst}, {integer}\n"));
                 } else {
-                    asm.push_str(&format!("\tldr x{dst}, ={integer}\n"));
+                    if instr != "ldr" {
+                        todo!("need to print the correct integer");
+                    }
+                    asm.push_str(&format!("\t{instr} {reg}{dst}, ={integer}\n"));
                 }
             }
         },
-        Arg::Const(_) => {
-            todo!("arg const");
-        }
     }
     Ok(())
 }
@@ -135,8 +150,17 @@ fn store_reg(
         .map_err(|_| format!("no store dst arg {dst}"))?
     {
         Arg::Var(id) => {
+            let (instr, reg) = match query.types.get(dst)? {
+                Type::U8 | Type::I8 => ("strb", "w"),
+                Type::U16 | Type::I16 => ("strh", "w"),
+                Type::U32 | Type::I32 => ("str", "w"),
+                Type::U64 | Type::I64 => ("str", "x"),
+                //
+                Type::Str => ("str", "x"),
+                Type::Not => unreachable!(),
+            };
             let offset = stack.get(id).ok_or("var unallocated")?;
-            asm.push_str(&format!("\tstr x{src}, [x29, -{offset}]\n"));
+            asm.push_str(&format!("\t{instr} {reg}{src}, [x29, -{offset}]\n"));
             Ok(())
         }
         _ => Err("can only store into var".into()),
@@ -195,7 +219,25 @@ fn asm(
                     store_reg(&mut asm, &query, stack.as_ref().unwrap(), *dst, sa)?;
                 }
             },
+            // NOTE: These operations are not masked because the codegen will just
+            // store it it into the stack anyway, so it always wraps. If any of that
+            // is optimized this will need to start masking the output.
             Ir::Bin { dst, lhs, rhs, bin } => {
+                let (div_prefix, reg) = match query.types.get(*dst)? {
+                    Type::U8 => ("u", "w"),
+                    Type::U16 => ("u", "w"),
+                    Type::U32 => ("u", "w"),
+                    Type::U64 => ("u", "x"),
+                    //
+                    Type::I8 => ("s", "w"),
+                    Type::I16 => ("s", "w"),
+                    Type::I32 => ("s", "w"),
+                    Type::I64 => ("s", "x"),
+                    //
+                    Type::Str => unreachable!(),
+                    Type::Not => unreachable!(),
+                };
+
                 load(&mut asm, &query, stack.as_ref().unwrap(), sb, *lhs)?;
                 load(&mut asm, &query, stack.as_ref().unwrap(), sc, *rhs)?;
                 match bin {
@@ -212,7 +254,7 @@ fn asm(
                             IrBinOp::Add => "add",
                             IrBinOp::Sub => "sub",
                             IrBinOp::Mul => "mul",
-                            IrBinOp::Div => "udiv",
+                            IrBinOp::Div => &format!("{div_prefix}div"),
                             IrBinOp::BitAnd => "and",
                             IrBinOp::BitOr => "orr",
                             IrBinOp::Xor => "eor",
@@ -220,7 +262,7 @@ fn asm(
                             IrBinOp::Shl => "lsl",
                             _ => unreachable!(),
                         };
-                        asm.push_str(&format!("\t{op} x{sa}, x{sb}, x{sc}\n"));
+                        asm.push_str(&format!("\t{op} {reg}{sa}, {reg}{sb}, {reg}{sc}\n"));
                         store_reg(&mut asm, &query, stack.as_ref().unwrap(), *dst, sa)?;
                     }
                     IrBinOp::Eq
@@ -238,13 +280,17 @@ fn asm(
                             IrBinOp::Le => "le",
                             _ => unreachable!(),
                         };
-                        asm.push_str(&format!("\tcmp x{sb}, x{sc}\n"));
-                        asm.push_str(&format!("\tcset x{sa}, {cond}\n"));
+                        asm.push_str(&format!("\tcmp {reg}{sb}, {reg}{sc}\n"));
+                        asm.push_str(&format!("\tcset {reg}{sa}, {cond}\n"));
                         store_reg(&mut asm, &query, stack.as_ref().unwrap(), *dst, sa)?;
                     }
                     IrBinOp::Mod => {
-                        asm.push_str(&format!("\tudiv x{sa}, x{sb}, x{sc}\n"));
-                        asm.push_str(&format!("\tmsub x{sa}, x{sa}, x{sc}, x{sb}\n"));
+                        asm.push_str(&format!(
+                            "\t{div_prefix}div {reg}{sa}, {reg}{sb}, {reg}{sc}\n"
+                        ));
+                        asm.push_str(&format!(
+                            "\tmsub {reg}{sa}, {reg}{sa}, {reg}{sc}, {reg}{sb}\n"
+                        ));
                         store_reg(&mut asm, &query, stack.as_ref().unwrap(), *dst, sa)?;
                     }
                 }
@@ -260,14 +306,14 @@ fn asm(
             Ir::JumpZero { label, arg } => {
                 let label = labels.get(*label).map_err(|_| "no asm jump zero label")?;
                 load(&mut asm, &query, stack.as_ref().unwrap(), sa, *arg)?;
-                asm.push_str(&format!("\tcbz x{sa}, {label}\n"));
+                asm.push_str(&format!("\tcbz w{sa}, {label}\n"));
             }
             Ir::JumpNotZero { label, arg } => {
                 let label = labels
                     .get(*label)
                     .map_err(|_| "no asm jump not zero label")?;
                 load(&mut asm, &query, stack.as_ref().unwrap(), sa, *arg)?;
-                asm.push_str(&format!("\tcbnz x{sa}, {label}\n"));
+                asm.push_str(&format!("\tcbnz w{sa}, {label}\n"));
             }
             Ir::Allocate { args: arguments } => {
                 let mut offset: usize = 8;
@@ -283,9 +329,9 @@ fn asm(
                     let layout = layouts
                         .get(*arg_entity)
                         .map_err(|_| format!("no allocate arg layout {arg_entity}"))?;
+                    offset += layout.size;
                     offset = offset.next_multiple_of(layout.align);
                     assert!(s.insert(*index, offset).is_none());
-                    offset += layout.size;
                 }
                 let size = offset.next_multiple_of(16);
                 stack_size = size;
@@ -444,8 +490,7 @@ fn asm(
                     asm.push_str(&format!("\tadd sp, sp, {stack_size}\n"));
                 }
 
-                assert!(returns.len() <= 1);
-                for arg in returns.iter() {
+                if let Some(arg) = returns {
                     let layout = layouts.get(*arg).map_err(|_| "no call return layout")?;
                     // If the parameter passing algorithm above would have packed
                     // the return value type into registers then it will use the
@@ -456,8 +501,8 @@ fn asm(
                     // value will be packed, and the remaining values will be stored
                     // in the address pointed to by x8.
                     assert!(!layout.composite);
-                    assert_eq!(layout.size, 8);
-                    assert_eq!(layout.align, 8);
+                    assert!(layout.size <= 8);
+                    assert!(layout.align <= 8);
                     store_reg(&mut asm, &query, stack, *arg, 0)?;
                 }
             }
@@ -493,11 +538,7 @@ fn asm(
                 }
             }
             Ir::ReturnAndDeallocate { returns } => {
-                assert!(returns.len() <= 1);
-                for entity in returns.iter() {
-                    // assert!(!layout.composite);
-                    // assert_eq!(layout.size, 8);
-                    // assert_eq!(layout.align, 8);
+                if let Some(entity) = returns {
                     load(&mut asm, &query, stack.as_ref().unwrap(), 0, *entity)?;
                 }
                 // TODO: This makes the codegen work, but I don't like how implicit

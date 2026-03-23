@@ -9,17 +9,25 @@ and implement the full compilation pipeline, from scratch, with no dependencies.
 
 ## Features
 Here is a list of the features I have identified as _necessary_ for completing my
-project. Funily enough, I actually don't really _need_ static type checking if a 
-I have reasonable assertions in the IR, and because it is the most difficult 
-feature I will consider it last.
+project.
 - [x] Functions
 - [ ] Arithmetic
     - [x] Bitwise 
-    - [ ] Signed/Unsigned integer
+    - [x] Signed/Unsigned integer
     - [ ] Vector
 - [ ] Pointers
 - [x] Control flow (if, while) 
 - [ ] Global data
+- [x] Constants (folded into literals at compile time)
 - [ ] Cortex-M33 codegen
-- [ ] Static type checking 
+- [x] Static type checking 
     - [ ] Casts
+
+### Notes
+Functions should be able to be defined locally, there needs to be a way to
+stop the `Scope` leaking into it, including `Arg` allocation in the IR stage.
+
+Naive constant folding involves a lossy transformation of the syntax tree,
+which means that errors downstream may report about things that are not longer
+present, but I think this is fine, since literals are folded after variable
+resolution and type checking which are bound to catch almost all of the errors.

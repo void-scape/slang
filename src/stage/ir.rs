@@ -1,4 +1,4 @@
-use crate::error::{ErrorKind, Report};
+use crate::error::Report;
 use crate::stage::Stage;
 use crate::stage::tokenize::Span;
 use crate::tree::{If, *};
@@ -78,10 +78,10 @@ pub enum Ir {
     Call {
         proc: Entity,
         arguments: Vec<Entity>,
-        returns: Vec<Entity>,
+        returns: Option<Entity>,
     },
     ReturnAndDeallocate {
-        returns: Vec<Entity>,
+        returns: Option<Entity>,
     },
 }
 
@@ -105,18 +105,12 @@ impl Literals {
 pub enum Arg {
     Var(usize),
     Lit(usize),
-    Const(usize),
 }
 
 impl Arg {
     pub fn allocate() -> Self {
         static UNIQUE: AtomicUsize = AtomicUsize::new(0);
         Self::Var(UNIQUE.fetch_add(1, Ordering::Relaxed))
-    }
-
-    pub fn allocate_const() -> Self {
-        static UNIQUE: AtomicUsize = AtomicUsize::new(0);
-        Self::Const(UNIQUE.fetch_add(1, Ordering::Relaxed))
     }
 }
 
@@ -130,7 +124,8 @@ pub struct Unique;
 pub struct Prologue;
 
 #[derive(Component)]
-pub struct Body;
+// crazy work on the name
+pub struct Narrative;
 
 #[derive(Component)]
 pub struct Epilogue;
@@ -202,7 +197,22 @@ macro_rules! ir {
 fn layout_types(mut commands: Commands, types: Query<(Entity, &Type), Without<Layout>>) {
     for (entity, ty) in types.iter() {
         let layout = match ty {
-            Type::U64 => Layout {
+            Type::U8 | Type::I8 => Layout {
+                size: 1,
+                align: 1,
+                composite: false,
+            },
+            Type::U16 | Type::I16 => Layout {
+                size: 2,
+                align: 2,
+                composite: false,
+            },
+            Type::U32 | Type::I32 => Layout {
+                size: 4,
+                align: 4,
+                composite: false,
+            },
+            Type::U64 | Type::I64 => Layout {
                 size: 8,
                 align: 8,
                 composite: false,
@@ -222,7 +232,7 @@ fn layout_types(mut commands: Commands, types: Query<(Entity, &Type), Without<La
 
 fn allocate_literals(
     mut commands: Commands,
-    literal_query: Query<(Entity, &Literal), With<Expr>>,
+    literal_query: Query<(Entity, &Literal)>,
     mut literals: ResMut<Literals>,
 ) {
     for (entity, lit) in literal_query.iter() {
@@ -251,15 +261,18 @@ fn check_not_args(
 
 fn allocate_declarations(
     mut commands: Commands,
-    decls: Query<Entity, (With<Declaration>, Without<Const>)>,
-    const_decls: Query<Entity, (With<Declaration>, With<Const>)>,
-) {
+    decls: Query<Entity, (With<Decl>, Without<Const>)>,
+    const_decls: Query<(Entity, &DeclExpr), (With<Const>, With<VarDecl>)>,
+    literals: Query<&Arg, With<Literal>>,
+) -> Result {
     for entity in decls.iter() {
         commands.entity(entity).insert(Arg::allocate());
     }
-    for entity in const_decls.iter() {
-        commands.entity(entity).insert(Arg::allocate_const());
+    for (entity, expr) in const_decls.iter() {
+        let arg = literals.get(expr.0)?;
+        commands.entity(entity).insert(*arg);
     }
+    Ok(())
 }
 
 fn allocate_variables(
@@ -283,15 +296,15 @@ fn insert_proc_epilogue(mut commands: Commands, procs: Query<(Entity, &Ident), W
 
 fn proc_ir(
     mut commands: Commands,
-    mut proc: Query<(Entity, &Proc, &Ident, Option<&Args>, Option<&Returns>)>,
+    mut proc: Query<(Entity, &Ident, &Args, &Returns, Option<&crate::tree::Body>), With<Proc>>,
     children: Query<&Children>,
     arg_entity: Query<&Arg>,
 ) -> Result {
-    for (entity, proc, ident, args, returns) in proc.iter_mut() {
+    for (entity, ident, args, returns, body) in proc.iter_mut() {
         let label = Label(ident.0);
         let prologue = commands.spawn((ChildOf(entity), label, Prologue)).id();
-        if let Some(proc_body) = proc.body {
-            let body = commands.spawn((ChildOf(entity), label, Body)).id();
+        if let Some(proc_body) = body {
+            let body = commands.spawn((ChildOf(entity), label, Narrative)).id();
             // see `insert_proc_epilogue`
             let epilogue = entity;
 
@@ -305,7 +318,7 @@ fn proc_ir(
 
             commands.spawn((Ir::Label { label: prologue }, IrOf(entity)));
             commands.spawn((Ir::Allocate { args: allocations }, IrOf(entity)));
-            if let Some(args) = args {
+            if args.len() > 0 {
                 commands.spawn((
                     Ir::LoadArguments {
                         arguments: args.to_vec(),
@@ -314,81 +327,80 @@ fn proc_ir(
                 ));
             }
             commands.spawn((Ir::Label { label: body }, IrOf(entity)));
-            commands.spawn((IrSub(proc_body), IrOf(entity)));
+            commands.spawn((IrSub(proc_body.0), IrOf(entity)));
             commands.spawn((Ir::Label { label: epilogue }, IrOf(entity)));
-            commands.spawn((
-                Ir::ReturnAndDeallocate {
-                    returns: returns.map(|r| r.to_vec()).unwrap_or_default(),
-                },
-                IrOf(entity),
-            ));
+            commands.spawn((Ir::ReturnAndDeallocate { returns: returns.0 }, IrOf(entity)));
         }
     }
     Ok(())
 }
 
-fn if_ir(mut commands: Commands, ifs: Query<(Entity, &If)>) {
-    for (entity, iff) in ifs.iter() {
-        let condition = commands.spawn((Unique, Label("if_condition"))).id();
-        let body = commands.spawn((Unique, Label("if_body"))).id();
-        let skip = commands.spawn((Unique, Label("if_skip"))).id();
+fn if_ir(mut commands: Commands, ifs: Query<(Entity, &Condition, &crate::tree::Body), With<If>>) {
+    for (entity, condition, body) in ifs.iter() {
+        let condition_label = commands.spawn((Unique, Label("if_condition"))).id();
+        let body_label = commands.spawn((Unique, Label("if_body"))).id();
+        let skip_label = commands.spawn((Unique, Label("if_skip"))).id();
 
         commands.entity(entity).insert(ir![
-            Ir::Label { label: condition },
-            IrSub(iff.condition),
-            Ir::JumpZero {
-                label: skip,
-                arg: iff.condition,
+            Ir::Label {
+                label: condition_label
             },
-            Ir::Label { label: body },
-            IrSub(iff.body),
-            Ir::Label { label: skip },
+            IrSub(condition.0),
+            Ir::JumpZero {
+                label: skip_label,
+                arg: condition.0,
+            },
+            Ir::Label { label: body_label },
+            IrSub(body.0),
+            Ir::Label { label: skip_label },
         ]);
     }
 }
 
-fn while_ir(mut commands: Commands, whiles: Query<(Entity, &While)>) {
-    for (entity, whilee) in whiles.iter() {
-        let condition = commands.spawn((Unique, Label("while_condition"))).id();
-        let body = commands.spawn((Unique, Label("while_body"))).id();
-        let exit = commands.spawn((Unique, Label("while_exit"))).id();
+fn while_ir(
+    mut commands: Commands,
+    whiles: Query<(Entity, &Condition, &crate::tree::Body), With<While>>,
+) {
+    for (entity, condition, body) in whiles.iter() {
+        let condition_label = commands.spawn((Unique, Label("while_condition"))).id();
+        let body_label = commands.spawn((Unique, Label("while_body"))).id();
+        let exit_label = commands.spawn((Unique, Label("while_exit"))).id();
 
         commands.entity(entity).insert(ir![
-            Ir::Label { label: condition },
-            IrSub(whilee.condition),
-            Ir::JumpZero {
-                label: exit,
-                arg: whilee.condition,
+            Ir::Label {
+                label: condition_label
             },
-            Ir::Label { label: body },
-            IrSub(whilee.body),
-            Ir::Jump { label: condition },
-            Ir::Label { label: exit },
+            IrSub(condition.0),
+            Ir::JumpZero {
+                label: exit_label,
+                arg: condition.0,
+            },
+            Ir::Label { label: body_label },
+            IrSub(body.0),
+            Ir::Jump {
+                label: condition_label
+            },
+            Ir::Label { label: exit_label },
         ]);
     }
 }
 
 fn return_ir(
     mut commands: Commands,
-    returns: Query<(Entity, &Return, &Span)>,
+    returns: Query<(Entity, Option<&ReturnExpr>), With<Return>>,
     return_args: TreeQuery<&Returns>,
     epilogues: TreeQuery<Entity, With<Epilogue>>,
 ) -> Result {
-    'outer: for (entity, ret, span) in returns.iter() {
-        let epilogue = epilogues
-            .first_ancestor(entity)
-            .map_err(|_| span.custom("Nothing to return from"))?;
-        let returns = return_args
-            .first_ancestor(entity)
-            .map_err(|_| span.kind(ErrorKind::NoReturns))?;
+    'outer: for (entity, return_expr) in returns.iter() {
+        let epilogue = epilogues.first_ancestor(entity)?;
+        let returns = return_args.first_ancestor(entity)?;
 
-        assert_eq!(returns.len(), ret.expr.is_some() as usize);
-        if let Some(expr) = ret.expr {
+        if let Some(ReturnExpr(expr)) = return_expr {
             commands.entity(entity).insert(ir![
-                IrSub(expr),
+                IrSub(*expr),
                 Ir::Store {
-                    dst: returns[0],
-                    src: expr,
+                    dst: returns.0.unwrap(),
+                    src: *expr,
                 },
                 Ir::Jump { label: epilogue },
             ]);
@@ -410,23 +422,21 @@ fn block_ir(mut commands: Commands, blocks: Query<(Entity, &Children), With<Bloc
     }
 }
 
-fn declaration_ir(mut commands: Commands, decls: Query<(Entity, &Declaration), Without<Const>>) {
-    for (entity, decl) in decls.iter() {
-        if let Some(expr) = decl.expr {
-            commands.entity(entity).insert(ir![
-                IrSub(expr),
-                Ir::Store {
-                    dst: entity,
-                    src: expr
-                }
-            ]);
-        }
+fn declaration_ir(mut commands: Commands, decls: Query<(Entity, &DeclExpr), Without<Const>>) {
+    for (entity, expr) in decls.iter() {
+        commands.entity(entity).insert(ir![
+            IrSub(expr.0),
+            Ir::Store {
+                dst: entity,
+                src: expr.0,
+            }
+        ]);
     }
 }
 
 fn call_ir(
     mut commands: Commands,
-    calls: Query<(Entity, &Ident, Option<&Children>, &Span, &Type), With<Call>>,
+    calls: Query<(Entity, &Ident, &CallArgs, &Span, &Type), With<Call>>,
     procs: Query<(Entity, &Ident), With<Proc>>,
 ) -> Result {
     for (entity, ident, args, span, ty) in calls.iter() {
@@ -436,29 +446,21 @@ fn call_ir(
             .ok_or(span.custom("Undefined procedure"))?;
         let returns = if *ty != Type::Not {
             commands.entity(entity).insert(Arg::allocate());
-            vec![entity]
+            Some(entity)
         } else {
-            Vec::new()
+            None
         };
-        if let Some(args) = args {
-            for arg in args.iter() {
-                commands.spawn((IrOf(entity), IrSub(arg)));
-            }
-            commands.spawn((
-                IrOf(entity),
-                Ir::Call {
-                    proc,
-                    arguments: args.to_vec(),
-                    returns,
-                },
-            ));
-        } else {
-            commands.entity(entity).insert(ir![Ir::Call {
-                proc,
-                arguments: Vec::new(),
-                returns,
-            }]);
+        for arg in args.iter() {
+            commands.spawn((IrOf(entity), IrSub(*arg)));
         }
+        commands.spawn((
+            IrOf(entity),
+            Ir::Call {
+                proc,
+                arguments: args.to_vec(),
+                returns,
+            },
+        ));
     }
     Ok(())
 }

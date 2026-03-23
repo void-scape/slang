@@ -9,18 +9,29 @@ use crate::{
 use bevy_app::prelude::*;
 use bevy_ecs::{prelude::*, system::SystemParam};
 use bevy_state::state::OnEnter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn plugin(app: &mut App) {
     app.add_systems(
         OnEnter(Stage::Scope),
         (
-            walk_source_files,
-            verify_all_variables_resolved,
+            (
+                verify_proc_names,
+                (walk_source_files, verify_all_variables_resolved).chain(),
+            ),
             super::next_stage,
         )
             .chain(),
     );
+}
+
+fn verify_proc_names(procs: Query<(&Ident, &Span), With<Proc>>) -> Result {
+    let mut set = HashSet::with_capacity(procs.iter().len());
+    for (ident, span) in procs.iter() {
+        set.insert(ident.0)
+            .ok_or(span.custom("Procedure redefinition"))?;
+    }
+    Ok(())
 }
 
 #[derive(SystemParam)]

@@ -39,7 +39,16 @@ fn parse(world: &mut World, tokens: &mut &[Token], root: Entity) -> Result<()> {
 fn parse_type(token: Token) -> Result<Type> {
     let ident = token.ident()?;
     match ident {
+        "u8" => Ok(Type::U8),
+        "u16" => Ok(Type::U16),
+        "u32" => Ok(Type::U32),
         "u64" => Ok(Type::U64),
+        //
+        "i8" => Ok(Type::I8),
+        "i16" => Ok(Type::I16),
+        "i32" => Ok(Type::I32),
+        "i64" => Ok(Type::I64),
+        //
         "str" => Ok(Type::Str),
         _ => Err(Error {
             kind: ErrorKind::InvalidType { ident },
@@ -63,7 +72,7 @@ fn ast(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
             }
         }
     }
-    for f in [proc, extern_proc, ret, iff, whilee, stmt, block_ast, constt] {
+    for f in [proc, extern_proc, constt, ret, iff, whilee, stmt, block_ast] {
         if let Some(entity) = recoverable(f(world, tokens))? {
             return Ok(entity);
         }
@@ -84,21 +93,20 @@ fn extern_proc(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
     tokens[2].is_kind(TokenKind::OpenParen)?;
     *tokens = &tokens[2..];
     let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-    let variadic = params(world, &tokens[1..end_args], root)?;
+    let (variadic, params) = params(world, &tokens[1..end_args], root)?;
     if variadic {
         world.entity_mut(root).insert(Variadic);
     }
     let mut last_token = tokens[end_args];
     *tokens = &tokens[end_args + 1..];
+    let mut return_entity = None;
     if tokens[0].is_kind_recoverable(TokenKind::Arrow).is_ok() {
         let ty = parse_type(tokens[1])?;
-        world.spawn((
-            ReturnOf(root),
-            ChildOf(root),
-            Declaration { expr: None },
-            ty,
-            tokens[1].span,
-        ));
+        return_entity = Some(
+            world
+                .spawn((ChildOf(root), RetDecl, ty, tokens[1].span))
+                .id(),
+        );
         last_token = tokens[1];
         *tokens = &tokens[2..];
     }
@@ -107,7 +115,9 @@ fn extern_proc(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
     world.entity_mut(root).insert((
         token.span.collapse(last_token.span),
         Extern,
-        Proc { body: None },
+        Proc,
+        Args(params),
+        Returns(return_entity),
     ));
     Ok(root)
 }
@@ -120,36 +130,37 @@ fn proc(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
     tokens[2].is_kind(TokenKind::OpenParen)?;
     *tokens = &tokens[2..];
     let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-    let variadic = params(world, &tokens[1..end_args], root)?;
+    let (variadic, params) = params(world, &tokens[1..end_args], root)?;
     if variadic {
         world.entity_mut(root).insert(Variadic);
     }
     *tokens = &tokens[end_args + 1..];
+    let mut return_entity = None;
     if tokens[0].is_kind_recoverable(TokenKind::Arrow).is_ok() {
         let ty = parse_type(tokens[1])?;
-        world.spawn((
-            ReturnOf(root),
-            ChildOf(root),
-            Declaration { expr: None },
-            ty,
-            tokens[1].span,
-        ));
+        return_entity = Some(
+            world
+                .spawn((ChildOf(root), RetDecl, ty, tokens[1].span))
+                .id(),
+        );
         *tokens = &tokens[2..];
     }
     let (block_entity, body_span) = block(world, tokens)?;
     world.entity_mut(block_entity).insert(ChildOf(root));
     world.entity_mut(root).insert((
         token.span.collapse(body_span),
-        Proc {
-            body: Some(block_entity),
-        },
+        Proc,
+        Args(params),
+        Returns(return_entity),
+        Body(block_entity),
     ));
     Ok(root)
 }
 
-fn params(world: &mut World, tokens: &[Token], root: Entity) -> Result<bool> {
+fn params(world: &mut World, tokens: &[Token], root: Entity) -> Result<(bool, Vec<Entity>)> {
+    let mut entities = Vec::new();
     if tokens.is_empty() {
-        return Ok(false);
+        return Ok((false, entities));
     }
     let start = tokens[0];
     let mut variadic = false;
@@ -166,16 +177,13 @@ fn params(world: &mut World, tokens: &[Token], root: Entity) -> Result<bool> {
         param[1].is_kind(TokenKind::Colon)?;
         let ty = parse_type(param[2])?;
         let span = param[0].span.collapse(param[2].span);
-        world.spawn((
-            ArgOf(root),
-            ChildOf(root),
-            Declaration { expr: None },
-            Ident(ident),
-            ty,
-            span,
-        ));
+        entities.push(
+            world
+                .spawn((ChildOf(root), ArgDecl, Ident(ident), ty, span))
+                .id(),
+        );
     }
-    Ok(variadic)
+    Ok((variadic, entities))
 }
 
 fn block(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
@@ -218,12 +226,12 @@ fn ret(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
     token.is_kind_recoverable(TokenKind::Return)?;
     *tokens = &tokens[1..];
     let entity = if tokens[0].kind == TokenKind::Semi {
-        world.spawn((Return { expr: None }, token.span)).id()
+        world.spawn((Return, Type::Not, token.span)).id()
     } else {
         let (expr, span) = bin_op(world, tokens, 0)?;
         let span = token.span.collapse(span);
-        let root = world.spawn((Return { expr: Some(expr) }, span)).id();
-        world.entity_mut(expr).insert((ChildOf(root), Expr));
+        let root = world.spawn((Return, span, ReturnExpr(expr))).id();
+        world.entity_mut(expr).insert(ChildOf(root));
         root
     };
     tokens[0].is_kind(TokenKind::Semi)?;
@@ -238,8 +246,10 @@ fn iff(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
     let (condition, _) = bin_op(world, tokens, 0)?;
     let (body, bspan) = block(world, tokens)?;
     let span = token.span.collapse(bspan);
-    let root = world.spawn((If { condition, body }, span)).id();
-    world.entity_mut(condition).insert((ChildOf(root), Expr));
+    let root = world
+        .spawn((If, Condition(condition), Body(body), span))
+        .id();
+    world.entity_mut(condition).insert(ChildOf(root));
     world.entity_mut(body).insert(ChildOf(root));
     Ok(root)
 }
@@ -251,8 +261,10 @@ fn whilee(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
     let (condition, _) = bin_op(world, tokens, 0)?;
     let (body, bspan) = block(world, tokens)?;
     let span = token.span.collapse(bspan);
-    let root = world.spawn((While { condition, body }, span)).id();
-    world.entity_mut(condition).insert((ChildOf(root), Expr));
+    let root = world
+        .spawn((While, Condition(condition), Body(body), span))
+        .id();
+    world.entity_mut(condition).insert(ChildOf(root));
     world.entity_mut(body).insert(ChildOf(root));
     Ok(root)
 }
@@ -268,7 +280,9 @@ fn constt(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
     let token = tokens[0];
     token.is_kind_recoverable(TokenKind::Const)?;
     *tokens = &tokens[1..];
-    let (decl, _) = declaration_expr(world, tokens)?;
+    let (decl, _) = var_decl(world, tokens)?;
+    tokens[0].is_kind(TokenKind::Semi)?;
+    *tokens = &tokens[1..];
     world.entity_mut(decl).insert(Const);
     Ok(decl)
 }
@@ -317,7 +331,7 @@ fn find_matching(
         }))
 }
 
-fn declaration_expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
+fn var_decl(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
     let start_span = tokens[0].span;
     let ident = Ident(tokens[0].ident()?);
     let ty = match tokens[1].kind {
@@ -327,7 +341,8 @@ fn declaration_expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity,
         }
         TokenKind::Colon => {
             let ty = parse_type(tokens[2])?;
-            *tokens = &tokens[3..];
+            tokens[3].is_kind(TokenKind::Equals)?;
+            *tokens = &tokens[4..];
             Some(ty)
         }
         got => {
@@ -339,25 +354,25 @@ fn declaration_expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity,
     };
     let (expr, espan) = bin_op(world, tokens, 0)?;
     let span = start_span.collapse(espan);
-    let root = world
-        .spawn((Declaration { expr: Some(expr) }, ident, span))
-        .id();
+    let root = world.spawn((VarDecl, DeclExpr(expr), ident, span)).id();
     if let Some(ty) = ty {
         world.entity_mut(root).insert(ty);
     }
-    world.entity_mut(expr).insert((ChildOf(root), Expr));
+    world.entity_mut(expr).insert(ChildOf(root));
     Ok((root, span))
 }
 
-fn args(world: &mut World, tokens: &[Token], root: Entity) -> Result<()> {
+fn args(world: &mut World, tokens: &[Token], root: Entity) -> Result<Vec<Entity>> {
+    let mut args = Vec::new();
     if tokens.is_empty() {
-        return Ok(());
+        return Ok(args);
     }
     for mut arg_tokens in tokens.split(|t| t.kind == TokenKind::Comma) {
         let (entity, _) = bin_op(world, &mut arg_tokens, 0)?;
-        world.entity_mut(entity).insert((ChildOf(root), Expr));
+        world.entity_mut(entity).insert(ChildOf(root));
+        args.push(entity);
     }
-    Ok(())
+    Ok(args)
 }
 
 fn expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
@@ -365,7 +380,7 @@ fn expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
     match token.kind {
         TokenKind::Let => {
             *tokens = &tokens[1..];
-            let (entity, span) = declaration_expr(world, tokens)?;
+            let (entity, span) = var_decl(world, tokens)?;
             Ok((entity, token.span.collapse(span)))
         }
         TokenKind::Ident(ident) => {
@@ -376,19 +391,19 @@ fn expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
                 .is_some_and(|t| t.kind == TokenKind::OpenParen)
             {
                 let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-                args(world, &tokens[1..end_args], root)?;
+                let args = args(world, &tokens[1..end_args], root)?;
                 let end_span = tokens[end_args].span;
                 *tokens = &tokens[end_args + 1..];
                 let span = token.span.collapse(end_span);
                 world
                     .entity_mut(root)
-                    .insert((Call, Ident(ident), Expr, span));
+                    .insert((Call, Ident(ident), CallArgs(args), span));
                 Ok((root, span))
             } else {
                 let span = token.span;
                 world
                     .entity_mut(root)
-                    .insert((Ident(ident), Variable, Expr, span));
+                    .insert((Ident(ident), Variable, span));
                 Ok((root, span))
             }
         }
@@ -415,7 +430,6 @@ fn expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
         TokenKind::OpenParen => {
             *tokens = &tokens[1..];
             let (entity, span) = bin_op(world, tokens, 0)?;
-            world.entity_mut(entity).insert(Expr);
             tokens[0].is_kind(TokenKind::CloseParen)?;
             *tokens = &tokens[1..];
             Ok((entity, span))

@@ -3,8 +3,10 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::too_many_arguments)]
 
+use crate::stage::Stage;
 use bevy_app::prelude::*;
 use bevy_ecs::component::Component;
+use std::{io::IsTerminal, time::Instant};
 
 mod error;
 mod stage;
@@ -26,6 +28,38 @@ impl Flags {
     }
 }
 
+#[derive(Component)]
+pub struct Timing {
+    now: Instant,
+    markers: Vec<(Stage, f32)>,
+}
+
+impl Timing {
+    pub fn finished(&mut self, stage: Stage) {
+        let dur = self.now.elapsed().as_secs_f32();
+        self.markers.push((stage, dur));
+        self.now = Instant::now();
+    }
+
+    pub fn report(&self) {
+        let total = self.markers.iter().fold(0.0, |total, (_, t)| total + t);
+        if std::io::stdout().is_terminal() {
+            println!("\x1b[92m\x1b[1mCompiled\x1b[0m in {total:.4}s");
+            for (stage, dur) in self.markers.iter() {
+                println!(
+                    "\x1b[38;5;246m... {:<10} {dur:.4}\x1b[0m",
+                    format!("{stage:?}")
+                );
+            }
+        } else {
+            println!("Compiled in {total:.4}s");
+            for (stage, dur) in self.markers.iter() {
+                println!("... {:<10} {dur:.4}", format!("{stage:?}"));
+            }
+        }
+    }
+}
+
 pub fn compile(flags: Flags) -> AppExit {
     let mut app = App::new();
     if flags.log {
@@ -33,7 +67,13 @@ pub fn compile(flags: Flags) -> AppExit {
     }
     // NOTE: The first state runs before PreStartup, so this needs to be
     // spawned here.
-    app.world_mut().spawn(flags);
+    app.world_mut().spawn((
+        flags,
+        Timing {
+            now: Instant::now(),
+            markers: Vec::new(),
+        },
+    ));
     app.add_plugins((stage::plugin, error::plugin))
         .set_runner(|mut app| {
             loop {
