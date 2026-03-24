@@ -1,12 +1,37 @@
-use crate::stage::{
-    Stage,
-    tokenize::{Span, Token, TokenKind, Tokens},
-};
+use crate::stage::tokenize::Span;
 use crate::tree::{If, *};
+use crate::{
+    error::Report,
+    stage::{
+        Stage,
+        tokenize::{Token, TokenKind, Tokens},
+    },
+};
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_state::state::OnEnter;
-use std::panic::Location;
+
+type Result<T> = std::result::Result<T, Error>;
+enum Error {
+    Cut(crate::error::Error),
+    Recoverable(Span),
+}
+impl From<crate::error::Error> for Error {
+    fn from(value: crate::error::Error) -> Self {
+        Self::Cut(value)
+    }
+}
+impl Error {
+    fn into_reportable_error(self) -> crate::error::Error {
+        match self {
+            Self::Cut(cut) => cut,
+            Self::Recoverable(span) => span.custom(
+                "Recoverable error ignored, \
+                this is a bug!",
+            ),
+        }
+    }
+}
 
 pub fn plugin(app: &mut App) {
     app.add_systems(
@@ -22,421 +47,363 @@ fn parse_files(world: &mut World) -> bevy_ecs::error::Result {
         .map(|(e, t)| (e, t.0.clone()))
         .collect::<Vec<_>>();
     for (root, tokens) in tokens.iter() {
-        parse(world, &mut tokens.as_slice(), *root)?;
-    }
-    Ok(())
-}
-
-fn parse(world: &mut World, tokens: &mut &[Token], root: Entity) -> Result<()> {
-    while !tokens.is_empty() {
-        let entity = ast(world, tokens)?;
-        world.entity_mut(entity).insert(ChildOf(root));
-    }
-    Ok(())
-}
-
-#[track_caller]
-fn parse_type(token: Token) -> Result<Type> {
-    let ident = token.ident()?;
-    match ident {
-        "u8" => Ok(Type::U8),
-        "u16" => Ok(Type::U16),
-        "u32" => Ok(Type::U32),
-        "u64" => Ok(Type::U64),
-        //
-        "i8" => Ok(Type::I8),
-        "i16" => Ok(Type::I16),
-        "i32" => Ok(Type::I32),
-        "i64" => Ok(Type::I64),
-        //
-        "str" => Ok(Type::Str),
-        _ => Err(Error {
-            kind: ErrorKind::InvalidType { ident },
-            span: token.span,
-            location: Location::caller(),
-        }),
-    }
-}
-
-#[track_caller]
-fn ast(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    fn recoverable(result: Result<Entity>) -> Result<Option<Entity>> {
-        match result {
-            Ok(e) => Ok(Some(e)),
-            Err(err) => {
-                if err.kind == ErrorKind::Recoverable {
-                    Ok(None)
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-    for f in [proc, extern_proc, constt, ret, iff, whilee, stmt, block_ast] {
-        if let Some(entity) = recoverable(f(world, tokens))? {
-            return Ok(entity);
-        }
-    }
-    // TODO: Change this error... what do we expect here?
-    Err(tokens[0].error(ErrorKind::Expression {
-        got: tokens[0].kind,
-    }))
-}
-
-fn extern_proc(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let token = tokens[0];
-    token.is_kind_recoverable(TokenKind::Extern)?;
-    *tokens = &tokens[1..];
-    tokens[0].is_kind(TokenKind::Fn)?;
-    let ident = tokens[1];
-    let root = world.spawn(Ident(ident.ident()?)).id();
-    tokens[2].is_kind(TokenKind::OpenParen)?;
-    *tokens = &tokens[2..];
-    let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-    let (variadic, params) = params(world, &tokens[1..end_args], root)?;
-    if variadic {
-        world.entity_mut(root).insert(Variadic);
-    }
-    let mut last_token = tokens[end_args];
-    *tokens = &tokens[end_args + 1..];
-    let mut return_entity = None;
-    if tokens[0].is_kind_recoverable(TokenKind::Arrow).is_ok() {
-        let ty = parse_type(tokens[1])?;
-        return_entity = Some(
-            world
-                .spawn((ChildOf(root), RetDecl, ty, tokens[1].span))
-                .id(),
-        );
-        last_token = tokens[1];
-        *tokens = &tokens[2..];
-    }
-    tokens[0].is_kind(TokenKind::Semi)?;
-    *tokens = &tokens[1..];
-    world.entity_mut(root).insert((
-        token.span.collapse(last_token.span),
-        Extern,
-        Proc,
-        Args(params),
-        Returns(return_entity),
-    ));
-    Ok(root)
-}
-
-fn proc(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let token = tokens[0];
-    token.is_kind_recoverable(TokenKind::Fn)?;
-    let ident = tokens[1];
-    let root = world.spawn(Ident(ident.ident()?)).id();
-    tokens[2].is_kind(TokenKind::OpenParen)?;
-    *tokens = &tokens[2..];
-    let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-    let (variadic, params) = params(world, &tokens[1..end_args], root)?;
-    if variadic {
-        world.entity_mut(root).insert(Variadic);
-    }
-    *tokens = &tokens[end_args + 1..];
-    let mut return_entity = None;
-    if tokens[0].is_kind_recoverable(TokenKind::Arrow).is_ok() {
-        let ty = parse_type(tokens[1])?;
-        return_entity = Some(
-            world
-                .spawn((ChildOf(root), RetDecl, ty, tokens[1].span))
-                .id(),
-        );
-        *tokens = &tokens[2..];
-    }
-    let (block_entity, body_span) = block(world, tokens)?;
-    world.entity_mut(block_entity).insert(ChildOf(root));
-    world.entity_mut(root).insert((
-        token.span.collapse(body_span),
-        Proc,
-        Args(params),
-        Returns(return_entity),
-        Body(block_entity),
-    ));
-    Ok(root)
-}
-
-fn params(world: &mut World, tokens: &[Token], root: Entity) -> Result<(bool, Vec<Entity>)> {
-    let mut entities = Vec::new();
-    if tokens.is_empty() {
-        return Ok((false, entities));
-    }
-    let start = tokens[0];
-    let mut variadic = false;
-    for param in tokens.split(|t| t.kind == TokenKind::Comma) {
-        if param.len() == 1 && param[0].kind == TokenKind::Variadic {
-            variadic = true;
-            // TODO: no named after variadic
+        if tokens.is_empty() {
             continue;
         }
-        if param.len() != 3 {
-            return Err(start.error(ErrorKind::Declaration { kind: "parameter" }));
-        }
-        let ident = param[0].ident()?;
-        param[1].is_kind(TokenKind::Colon)?;
-        let ty = parse_type(param[2])?;
-        let span = param[0].span.collapse(param[2].span);
-        entities.push(
-            world
-                .spawn((ChildOf(root), ArgDecl, Ident(ident), ty, span))
-                .id(),
-        );
-    }
-    Ok((variadic, entities))
-}
-
-fn block(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
-    let entity = world.spawn(Block).id();
-    let start = tokens[0];
-    // TODO: This is always non recoverable?
-    start.is_kind(TokenKind::OpenCurly)?;
-    let end = find_matching(tokens, TokenKind::OpenCurly, TokenKind::CloseCurly)?;
-    let block = &mut &tokens[1..end];
-    let end_span = tokens[end].span;
-    *tokens = &tokens[end + 1..];
-    while !block.is_empty() {
-        let child = ast(world, block)?;
-        world.entity_mut(child).insert(ChildOf(entity));
-    }
-    let span = start.span.collapse(end_span);
-    world.entity_mut(entity).insert(span);
-    Ok((entity, span))
-}
-
-fn block_ast(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let entity = world.spawn(Block).id();
-    let start = tokens[0];
-    start.is_kind_recoverable(TokenKind::OpenCurly)?;
-    let end = find_matching(tokens, TokenKind::OpenCurly, TokenKind::CloseCurly)?;
-    let block = &mut &tokens[1..end];
-    let end_span = tokens[end].span;
-    *tokens = &tokens[end + 1..];
-    while !block.is_empty() {
-        let child = ast(world, block)?;
-        world.entity_mut(child).insert(ChildOf(entity));
-    }
-    let span = start.span.collapse(end_span);
-    world.entity_mut(entity).insert(span);
-    Ok(entity)
-}
-
-fn ret(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let token = tokens[0];
-    token.is_kind_recoverable(TokenKind::Return)?;
-    *tokens = &tokens[1..];
-    let entity = if tokens[0].kind == TokenKind::Semi {
-        world.spawn((Return, Type::Not, token.span)).id()
-    } else {
-        let (expr, span) = bin_op(world, tokens, 0)?;
-        let span = token.span.collapse(span);
-        let root = world.spawn((Return, span, ReturnExpr(expr))).id();
-        world.entity_mut(expr).insert(ChildOf(root));
-        root
-    };
-    tokens[0].is_kind(TokenKind::Semi)?;
-    *tokens = &tokens[1..];
-    Ok(entity)
-}
-
-fn iff(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let token = tokens[0];
-    token.is_kind_recoverable(TokenKind::If)?;
-    *tokens = &tokens[1..];
-    let (condition, _) = bin_op(world, tokens, 0)?;
-    let (body, bspan) = block(world, tokens)?;
-    let span = token.span.collapse(bspan);
-    let root = world
-        .spawn((If, Condition(condition), Body(body), span))
-        .id();
-    world.entity_mut(condition).insert(ChildOf(root));
-    world.entity_mut(body).insert(ChildOf(root));
-    Ok(root)
-}
-
-fn whilee(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let token = tokens[0];
-    token.is_kind_recoverable(TokenKind::While)?;
-    *tokens = &tokens[1..];
-    let (condition, _) = bin_op(world, tokens, 0)?;
-    let (body, bspan) = block(world, tokens)?;
-    let span = token.span.collapse(bspan);
-    let root = world
-        .spawn((While, Condition(condition), Body(body), span))
-        .id();
-    world.entity_mut(condition).insert(ChildOf(root));
-    world.entity_mut(body).insert(ChildOf(root));
-    Ok(root)
-}
-
-fn stmt(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let (expr, _) = bin_op(world, tokens, 0)?;
-    tokens[0].is_kind(TokenKind::Semi)?;
-    *tokens = &tokens[1..];
-    Ok(expr)
-}
-
-fn constt(world: &mut World, tokens: &mut &[Token]) -> Result<Entity> {
-    let token = tokens[0];
-    token.is_kind_recoverable(TokenKind::Const)?;
-    *tokens = &tokens[1..];
-    let (decl, _) = var_decl(world, tokens)?;
-    tokens[0].is_kind(TokenKind::Semi)?;
-    *tokens = &tokens[1..];
-    world.entity_mut(decl).insert(Const);
-    Ok(decl)
-}
-
-impl Token {
-    #[track_caller]
-    fn is_kind(&self, kind: TokenKind) -> Result<()> {
-        (self.kind == kind).ok_or(self.error(ErrorKind::Expected {
-            expected: kind,
-            got: Some(self.kind),
-        }))
-    }
-
-    fn is_kind_recoverable(&self, kind: TokenKind) -> Result<()> {
-        (self.kind == kind).ok_or_else(Error::recoverable)
-    }
-
-    #[track_caller]
-    fn ident(&self) -> Result<&'static str> {
-        match self.kind {
-            TokenKind::Ident(ident) => Ok(ident),
-            token => Err(self.error(ErrorKind::ExpectedIdent { got: token })),
+        let mut parser = Parser {
+            world,
+            tokens: &mut tokens.as_slice(),
+            last: tokens[0].span,
+        };
+        // NOTE: `any` will return an error if it can't parse the input, so this
+        // will never hang.
+        while !parser.tokens.is_empty() {
+            let entity = parser.any().map_err(|err| err.into_reportable_error())?;
+            parser.make_child(*root, entity);
         }
     }
+    Ok(())
 }
 
-#[track_caller]
-fn find_matching(
-    tokens: &[Token],
-    open: TokenKind,
-    close: TokenKind,
-) -> std::result::Result<usize, Error> {
-    let o = &mut 0;
-    tokens
-        .iter()
-        .position(|t| {
-            if t.kind == open {
-                *o += 1;
-            } else if t.kind == close {
-                *o -= 1;
+// COMMON CONSTRUCTS
+
+impl<'p> Parser<'p> {
+    fn any_of(
+        &mut self,
+        fs: &[fn(&mut Parser<'p>) -> Result<Entity>],
+        err: &'static str,
+    ) -> Result<Entity> {
+        for f in fs.iter() {
+            match f(self) {
+                Ok(entity) => {
+                    return Ok(entity);
+                }
+                Err(Error::Cut(cut)) => return Err(Error::Cut(cut)),
+                Err(Error::Recoverable(_)) => {}
             }
-            *o == 0
-        })
-        .ok_or(tokens[0].error(ErrorKind::UnmatchedDelimiter {
-            delimiter: tokens[0].kind,
-        }))
+        }
+        Err(self.last.custom(err).into())
+    }
+
+    fn any(&mut self) -> Result<Entity> {
+        self.any_of(
+            &[
+                Self::proc_recoverable,
+                Self::extern_proc_recoverable,
+                Self::const_recoverable,
+                Self::let_recoverable,
+                Self::return_recoverable,
+                Self::if_recoverable,
+                Self::while_recoverable,
+                Self::block_recoverable,
+                // NOTE: This is not recoverable because garbage might be
+                // spawned by `bin_op`, so we can't just continue.
+                Self::bin_op_stmt,
+            ],
+            "How did you get here ;-)",
+        )
+    }
+
+    fn ty(&mut self) -> Result<(Span, Type)> {
+        let (span, ident) = self.eat_ident_spanned()?;
+        let ty = match ident.0 {
+            "u8" => Type::U8,
+            "u16" => Type::U16,
+            "u32" => Type::U32,
+            "u64" => Type::U64,
+            //
+            "i8" => Type::I8,
+            "i16" => Type::I16,
+            "i32" => Type::I32,
+            "i64" => Type::I64,
+            //
+            "str" => Type::Str,
+            _ => return Err(span.custom("Undeclared type").into()),
+        };
+        Ok((span, ty))
+    }
+
+    fn block_recoverable(&mut self) -> Result<Entity> {
+        if self.peek().is_some_and(|t| t.kind == TokenKind::OpenCurly) {
+            self.block()
+        } else {
+            Err(self.eat_kind_recoverable(TokenKind::OpenCurly).unwrap_err())
+        }
+    }
+
+    fn block(&mut self) -> Result<Entity> {
+        let root = self.new_entity();
+        let start = self.eat_kind(TokenKind::OpenCurly)?;
+        while self.peek().is_some_and(|t| t.kind != TokenKind::CloseCurly) {
+            let child = self.any()?;
+            self.make_child(root, child);
+        }
+        let end = self.eat_kind(TokenKind::CloseCurly)?;
+        self.insert(root, Block);
+        self.insert_spanned(root, start.span, end.span);
+        Ok(root)
+    }
 }
 
-fn var_decl(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
-    let start_span = tokens[0].span;
-    let ident = Ident(tokens[0].ident()?);
-    let ty = match tokens[1].kind {
-        TokenKind::Equals => {
-            *tokens = &tokens[2..];
-            None
-        }
-        TokenKind::Colon => {
-            let ty = parse_type(tokens[2])?;
-            tokens[3].is_kind(TokenKind::Equals)?;
-            *tokens = &tokens[4..];
-            Some(ty)
-        }
-        got => {
-            return Err(tokens[1].error(ErrorKind::Expected {
-                expected: TokenKind::Equals,
-                got: Some(got),
-            }));
-        }
-    };
-    let (expr, espan) = bin_op(world, tokens, 0)?;
-    let span = start_span.collapse(espan);
-    let root = world.spawn((VarDecl, DeclExpr(expr), ident, span)).id();
-    if let Some(ty) = ty {
-        world.entity_mut(root).insert(ty);
+// PROCEDURES
+
+impl Parser<'_> {
+    fn proc_recoverable(&mut self) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(TokenKind::Fn)?;
+        let root = self.proc_sig()?;
+        let body = self.block()?;
+        let body_span = self.span(body);
+        self.make_child(root, body);
+        self.insert_spanned(root, start.span, body_span);
+        self.insert(root, Body(body));
+        Ok(root)
     }
-    world.entity_mut(expr).insert(ChildOf(root));
-    Ok((root, span))
+
+    fn extern_proc_recoverable(&mut self) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(TokenKind::Extern)?;
+        self.eat_kind(TokenKind::Fn)?;
+        let root = self.proc_sig()?;
+        let end = self.eat_kind(TokenKind::Semi)?;
+        self.insert_spanned(root, start.span, end.span);
+        self.insert(root, Extern);
+        Ok(root)
+    }
+
+    fn proc_sig(&mut self) -> Result<Entity> {
+        let ident = self.eat_ident()?;
+        let root = self.new_entity();
+
+        let mut args = Vec::new();
+        self.eat_kind(TokenKind::OpenParen)?;
+        let mut first = true;
+        while self.peek().is_some_and(|t| t.kind != TokenKind::CloseParen) {
+            if !first {
+                self.eat_kind(TokenKind::Comma)?;
+            }
+            if self.eat_kind_recoverable(TokenKind::Variadic).is_ok() {
+                self.insert(root, Variadic);
+                break;
+            }
+            let (start, ident) = self.eat_ident_spanned()?;
+            self.eat_kind(TokenKind::Colon)?;
+            let (end, ty) = self.ty()?;
+            let arg = self.world.spawn((ChildOf(root), ArgDecl, ident, ty)).id();
+            self.insert_spanned(arg, start, end);
+            args.push(arg);
+            first = false;
+        }
+        self.eat_kind(TokenKind::CloseParen)?;
+
+        self.insert(root, (Proc, ident, Args(args), Returns(None)));
+        if self.eat_kind_recoverable(TokenKind::Arrow).is_ok() {
+            let (span, ty) = self.ty()?;
+            let entity = self.world.spawn((ChildOf(root), RetDecl, ty, span)).id();
+            self.insert(root, Returns(Some(entity)));
+        }
+
+        Ok(root)
+    }
 }
 
-fn args(world: &mut World, tokens: &[Token], root: Entity) -> Result<Vec<Entity>> {
-    let mut args = Vec::new();
-    if tokens.is_empty() {
-        return Ok(args);
+// CONTROL FLOW
+
+impl Parser<'_> {
+    fn condition_and_body_recoverable(
+        &mut self,
+        token: TokenKind,
+        bundle: impl Bundle,
+    ) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(token)?;
+        let root = self.new_entity();
+
+        let condition = self.bin_op()?;
+        let body = self.block()?;
+        self.make_child(root, condition);
+        self.make_child(root, body);
+
+        self.insert(root, (bundle, Condition(condition), Body(body)));
+        let end = self.span(body);
+        self.insert_spanned(root, start.span, end);
+        Ok(root)
     }
-    for mut arg_tokens in tokens.split(|t| t.kind == TokenKind::Comma) {
-        let (entity, _) = bin_op(world, &mut arg_tokens, 0)?;
-        world.entity_mut(entity).insert(ChildOf(root));
-        args.push(entity);
+
+    fn if_recoverable(&mut self) -> Result<Entity> {
+        self.condition_and_body_recoverable(TokenKind::If, If)
     }
-    Ok(args)
+
+    fn while_recoverable(&mut self) -> Result<Entity> {
+        self.condition_and_body_recoverable(TokenKind::While, While)
+    }
+
+    fn return_recoverable(&mut self) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(TokenKind::Return)?;
+        if self.peek().is_some_and(|t| t.kind == TokenKind::Semi) {
+            let end = self.eat_kind(TokenKind::Semi)?;
+            let root = self.world.spawn((Return, Type::Not)).id();
+            self.insert_spanned(root, start.span, end.span);
+            Ok(root)
+        } else {
+            let expr = self.bin_op()?;
+            let root = self.world.spawn((Return, ReturnExpr(expr))).id();
+            self.make_child(root, expr);
+            let end = self.eat_kind(TokenKind::Semi)?;
+            self.insert_spanned(root, start.span, end.span);
+            Ok(root)
+        }
+    }
 }
 
-fn expr(world: &mut World, tokens: &mut &[Token]) -> Result<(Entity, Span)> {
-    let token = tokens[0];
+// STATEMENTS
+
+impl Parser<'_> {
+    // NOTE: not really a statement?
+    fn var_decl(&mut self) -> Result<Entity> {
+        let (start, ident) = self.eat_ident_spanned()?;
+        let root = self.new_entity();
+
+        if self.eat_kind_recoverable(TokenKind::Colon).is_ok() {
+            let (_, ty) = self.ty()?;
+            self.insert(root, ty);
+        }
+
+        self.eat_kind(TokenKind::Equals)?;
+        let expr = self.bin_op()?;
+        self.make_child(root, expr);
+
+        self.insert(root, (VarDecl, ident, DeclExpr(expr)));
+        let end = self.span(expr);
+        self.insert_spanned(root, start, end);
+
+        Ok(root)
+    }
+
+    fn let_recoverable(&mut self) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(TokenKind::Let)?;
+        let decl = self.var_decl()?;
+        let end = self.eat_kind(TokenKind::Semi)?;
+        self.insert_spanned(decl, start.span, end.span);
+        Ok(decl)
+    }
+
+    fn const_recoverable(&mut self) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(TokenKind::Const)?;
+        let decl = self.var_decl()?;
+        let end = self.eat_kind(TokenKind::Semi)?;
+        self.insert_spanned(decl, start.span, end.span);
+        self.insert(decl, Const);
+        Ok(decl)
+    }
+
+    fn bin_op_stmt(&mut self) -> Result<Entity> {
+        let expr = self.bin_op()?;
+        let start = self.span(expr);
+        let end = self.eat_kind(TokenKind::Semi)?;
+        self.insert_spanned(expr, start, end.span);
+        Ok(expr)
+    }
+}
+
+// EXPRESSIONS
+
+impl Parser<'_> {
+    fn expr(&mut self) -> Result<Entity> {
+        self.any_of(
+            &[
+                Self::call,
+                Self::variable,
+                Self::integer,
+                Self::str,
+                Self::not,
+                Self::paren,
+            ],
+            "Invalid expression",
+        )
+    }
+
+    fn call(&mut self) -> Result<Entity> {
+        // NOTE: Recoverable because this might just be a variable, in which case
+        // `variable` will return the ident as a variable.
+        if self.tokens.len() < 2 || self.tokens[1].kind != TokenKind::OpenParen {
+            return Err(Error::Recoverable(self.last));
+        }
+
+        let (start, ident) = self.eat_ident_spanned_recoverable()?;
+        let mut args = Vec::new();
+        self.eat_kind(TokenKind::OpenParen)?;
+        let root = self.new_entity();
+        let mut first = true;
+        while self.peek().is_some_and(|t| t.kind != TokenKind::CloseParen) {
+            if !first {
+                self.eat_kind(TokenKind::Comma)?;
+            }
+            let expr = self.bin_op()?;
+            self.make_child(root, expr);
+            args.push(expr);
+            first = false;
+        }
+        let end = self.eat_kind(TokenKind::CloseParen)?;
+        self.insert(root, (Call, ident, CallArgs(args)));
+        self.insert_spanned(root, start, end.span);
+        Ok(root)
+    }
+
+    fn variable(&mut self) -> Result<Entity> {
+        let (span, ident) = self.eat_ident_spanned_recoverable()?;
+        Ok(self.world.spawn((ident, Variable, span)).id())
+    }
+
+    fn integer(&mut self) -> Result<Entity> {
+        let (span, integer) =
+            self.eat_fn_recoverable(integer_spanned, "Expected integer literal")?;
+        Ok(self.world.spawn((Literal::Integer(integer), span)).id())
+    }
+
+    fn str(&mut self) -> Result<Entity> {
+        let (span, str) = self.eat_fn_recoverable(str_spanned, "Expected integer literal")?;
+        Ok(self.world.spawn((Literal::Str(str), span)).id())
+    }
+
+    fn not(&mut self) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(TokenKind::Bang)?;
+        let expr = self.expr()?;
+        let root = self.world.spawn(UnaryOp::Not).id();
+        let end = self.span(expr);
+        self.insert_spanned(root, start.span, end);
+        self.make_child(root, expr);
+        Ok(root)
+    }
+
+    fn paren(&mut self) -> Result<Entity> {
+        let start = self.eat_kind_recoverable(TokenKind::OpenParen)?;
+        let expr = self.bin_op()?;
+        let end = self.eat_kind(TokenKind::CloseParen)?;
+        self.insert_spanned(expr, start.span, end.span);
+        Ok(expr)
+    }
+}
+
+fn ident_spanned(token: Token) -> Result<(Span, Ident)> {
     match token.kind {
-        TokenKind::Let => {
-            *tokens = &tokens[1..];
-            let (entity, span) = var_decl(world, tokens)?;
-            Ok((entity, token.span.collapse(span)))
-        }
-        TokenKind::Ident(ident) => {
-            *tokens = &tokens[1..];
-            let root = world.spawn_empty().id();
-            if tokens
-                .first()
-                .is_some_and(|t| t.kind == TokenKind::OpenParen)
-            {
-                let end_args = find_matching(tokens, TokenKind::OpenParen, TokenKind::CloseParen)?;
-                let args = args(world, &tokens[1..end_args], root)?;
-                let end_span = tokens[end_args].span;
-                *tokens = &tokens[end_args + 1..];
-                let span = token.span.collapse(end_span);
-                world
-                    .entity_mut(root)
-                    .insert((Call, Ident(ident), CallArgs(args), span));
-                Ok((root, span))
-            } else {
-                let span = token.span;
-                world
-                    .entity_mut(root)
-                    .insert((Ident(ident), Variable, span));
-                Ok((root, span))
-            }
-        }
-        TokenKind::Integer(integer) => {
-            *tokens = &tokens[1..];
-            let span = token.span;
-            let entity = world.spawn((Literal::Integer(integer), span)).id();
-            Ok((entity, span))
-        }
-        TokenKind::Str(str) => {
-            *tokens = &tokens[1..];
-            let span = token.span;
-            let entity = world.spawn((Literal::Str(str), span)).id();
-            Ok((entity, span))
-        }
-        TokenKind::Not => {
-            *tokens = &tokens[1..];
-            let (expr, espan) = expr(world, tokens)?;
-            let span = token.span.collapse(espan);
-            let root = world.spawn((UnaryOp::Not, span)).id();
-            world.entity_mut(expr).insert(ChildOf(root));
-            Ok((root, span))
-        }
-        TokenKind::OpenParen => {
-            *tokens = &tokens[1..];
-            let (entity, span) = bin_op(world, tokens, 0)?;
-            tokens[0].is_kind(TokenKind::CloseParen)?;
-            *tokens = &tokens[1..];
-            Ok((entity, span))
-        }
-        got => Err(tokens[0].error(ErrorKind::Expression { got })),
+        TokenKind::Ident(ident) => Ok((token.span, Ident(ident))),
+        _ => Err(token.span.custom("Expected identifier").into()),
     }
 }
+
+fn integer_spanned(token: Token) -> Result<(Span, u64)> {
+    match token.kind {
+        TokenKind::Integer(integer) => Ok((token.span, integer)),
+        _ => Err(token.span.custom("Expected integer literal").into()),
+    }
+}
+
+fn str_spanned(token: Token) -> Result<(Span, &'static str)> {
+    match token.kind {
+        TokenKind::Str(str) => Ok((token.span, str)),
+        _ => Err(token.span.custom("Expected string literal").into()),
+    }
+}
+
+// BINARY OPERATIONS
 
 impl BinOp {
     // Precedence according to the rust standard, of which I am familiar with:
@@ -522,115 +489,154 @@ impl BinOp {
     }
 }
 
+impl Parser<'_> {
+    fn bin_op(&mut self) -> Result<Entity> {
+        bin_op(self, 0)
+    }
+}
+
 // Stolen from tsoding's B compiler:
 // https://github.com/bext-lang/b/blob/main/src/b.rs#L515
-fn bin_op(world: &mut World, tokens: &mut &[Token], precedence: usize) -> Result<(Entity, Span)> {
+fn bin_op(parser: &mut Parser, precedence: usize) -> Result<Entity> {
     if precedence > BinOp::max_precedence() {
-        return expr(world, tokens);
+        return parser.expr();
     }
 
-    let mut lhs = bin_op(world, tokens, precedence + 1)?;
-    let mut saved = *tokens;
+    let mut lhs = bin_op(parser, precedence + 1)?;
+    let mut saved = (*parser.tokens, parser.last);
 
-    if !tokens.is_empty()
-        && let Some(op) = BinOp::from_token(tokens[0].kind)
+    if !parser.tokens.is_empty()
+        && let Some(op) = BinOp::from_token(parser.tokens[0].kind)
         && op.precedence() == precedence
     {
-        while !tokens.is_empty()
-            && let Some(op) = BinOp::from_token(tokens[0].kind)
+        while !parser.tokens.is_empty()
+            && let Some(op) = BinOp::from_token(parser.tokens[0].kind)
             && op.precedence() == precedence
         {
-            *tokens = &tokens[1..];
-            let rhs = bin_op(world, tokens, precedence + 1)?;
-            let new_span = lhs.1.collapse(rhs.1);
-            let new_entity = world.spawn((op, new_span)).id();
-            world.entity_mut(lhs.0).insert(ChildOf(new_entity));
-            world.entity_mut(rhs.0).insert(ChildOf(new_entity));
-            lhs = (new_entity, new_span);
-            saved = *tokens;
+            parser.eat();
+            let rhs = bin_op(parser, precedence + 1)?;
+            // let new_span = lhs.1.collapse(rhs.1);
+            let new_entity = parser.world.spawn(op).id();
+            let rhs_span = parser.span(rhs);
+            let lhs_span = parser.span(lhs);
+            parser.insert_spanned(new_entity, lhs_span, rhs_span);
+            parser.make_child(new_entity, lhs);
+            parser.make_child(new_entity, rhs);
+            lhs = new_entity;
+            saved = (*parser.tokens, parser.last);
         }
     }
 
-    *tokens = saved;
+    *parser.tokens = saved.0;
+    parser.last = saved.1;
     Ok(lhs)
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+// PARSING UTILITY
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct Error {
-    pub kind: ErrorKind,
-    pub span: Span,
-    pub location: &'static Location<'static>,
+struct Parser<'a> {
+    world: &'a mut World,
+    tokens: &'a mut &'a [Token],
+    last: Span,
 }
 
-impl Error {
-    #[track_caller]
-    fn recoverable() -> Self {
-        Self {
-            kind: ErrorKind::Recoverable,
-            span: Span::default(),
-            location: Location::caller(),
+impl Parser<'_> {
+    fn eat(&mut self) -> Option<Token> {
+        if !self.tokens.is_empty() {
+            let token = self.tokens[0];
+            *self.tokens = &self.tokens[1..];
+            self.last = token.span;
+            Some(token)
+        } else {
+            None
         }
     }
-}
 
-impl Token {
-    #[track_caller]
-    fn error(&self, kind: ErrorKind) -> Error {
-        Error {
-            kind,
-            span: self.span,
-            location: Location::caller(),
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.first()
+    }
+
+    fn eat_kind(&mut self, kind: TokenKind) -> Result<Token> {
+        // NOTE: Complicated expression here because we dont want to be formatting
+        // strings for lots of tokens!
+        Ok(self
+            .eat()
+            .map(|token| {
+                (token.kind == kind)
+                    .then_some(token)
+                    .ok_or_else(|| token.span.msg(format!("Expected `{kind}`")))
+            })
+            .ok_or_else(|| self.last.msg(format!("Expected `{kind}`")))??)
+    }
+
+    fn eat_kind_recoverable(&mut self, kind: TokenKind) -> Result<Token> {
+        if self.peek().is_some_and(|t| t.kind == kind) {
+            Ok(self.eat().unwrap())
+        } else {
+            Err(Error::Recoverable(self.last))
         }
     }
-}
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum ErrorKind {
-    Recoverable,
-    Expected {
-        expected: TokenKind,
-        got: Option<TokenKind>,
-    },
-    InvalidType {
-        ident: &'static str,
-    },
-    ExpectedIdent {
-        got: TokenKind,
-    },
-    UnmatchedDelimiter {
-        delimiter: TokenKind,
-    },
-    Declaration {
-        kind: &'static str,
-    },
-    Expression {
-        got: TokenKind,
-    },
-}
-
-impl std::error::Error for Error {}
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.kind {
-            ErrorKind::Recoverable => f.write_str("Recoverable error not handled, this is a bug!"),
-            ErrorKind::Expected { expected, got } => {
-                if let Some(got) = got {
-                    f.write_str(&format!("Expected `{expected}`, got `{got}`"))
-                } else {
-                    f.write_str(&format!("Expected `{expected}`"))
-                }
-            }
-            ErrorKind::InvalidType { ident } => f.write_str(&format!("Invalid type `{ident}`")),
-            ErrorKind::ExpectedIdent { got } => {
-                f.write_str(&format!("Expected identifier, got `{got}`"))
-            }
-            ErrorKind::UnmatchedDelimiter { delimiter } => {
-                f.write_str(&format!("Unmatched delimiter `{delimiter}`"))
-            }
-            ErrorKind::Declaration { kind } => f.write_str(&format!("Invalid {kind} declaration")),
-            ErrorKind::Expression { got } => f.write_str(&format!("Invalid expression `{got}`")),
+    fn eat_fn<R>(&mut self, f: impl Fn(Token) -> Result<R>, err: &'static str) -> Result<R> {
+        match self.eat() {
+            Some(token) => f(token),
+            None => Err(self.last.custom(err).into()),
         }
+    }
+
+    fn eat_fn_recoverable<R>(
+        &mut self,
+        f: impl Fn(Token) -> Result<R>,
+        err: &'static str,
+    ) -> Result<R> {
+        let chk = (*self.tokens, self.last);
+        match self.eat_fn(f, err) {
+            Ok(r) => Ok(r),
+            Err(_) => {
+                *self.tokens = chk.0;
+                self.last = chk.1;
+                Err(Error::Recoverable(self.last))
+            }
+        }
+    }
+
+    fn eat_ident_spanned(&mut self) -> Result<(Span, Ident)> {
+        self.eat_fn(ident_spanned, "Expected identifier")
+    }
+
+    fn eat_ident_spanned_recoverable(&mut self) -> Result<(Span, Ident)> {
+        self.eat_fn_recoverable(ident_spanned, "Expected identifier")
+    }
+
+    fn eat_ident(&mut self) -> Result<Ident> {
+        Ok(self.eat_ident_spanned()?.1)
+    }
+
+    fn new_entity(&mut self) -> Entity {
+        self.world.spawn_empty().id()
+    }
+
+    fn insert(&mut self, entity: Entity, bundle: impl Bundle) {
+        self.world.entity_mut(entity).insert(bundle);
+    }
+
+    fn span(&self, entity: Entity) -> Span {
+        *self.world.entity(entity).get::<Span>().unwrap()
+    }
+
+    fn insert_spanned(&mut self, entity: Entity, start: Span, end: Span) {
+        debug_assert_eq!(start.location, end.location);
+        self.insert(
+            entity,
+            Span {
+                start: start.start.min(end.start),
+                end: start.end.max(end.end),
+                location: start.location,
+            },
+        );
+    }
+
+    fn make_child(&mut self, root: Entity, child: Entity) {
+        self.world.entity_mut(child).insert(ChildOf(root));
     }
 }
